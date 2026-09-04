@@ -1,0 +1,329 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Weekly drift sampling for the wasm-eh-latest-nightly-canary job (W-4 review A#1/B#4):
+    # without this, quiet weeks would never exercise the unpinned-nightly lane at all.
+    - cron: "17 3 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins 1.96.0 + components + targets; the action honors it.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-none, wasm32-unknown-unknown, wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # GATE REGISTRY (O-14 A-4): this workspace run IS the CI promotion of the otter-wasmemit
+      # AOT gate suite (crates/otter-wasmemit/tests/aot.rs) — record==live R1/R2/R3 (design §5.2),
+      # the AOT⊂JIT 3-way differential + fail-closed + refusal-pair gates (§6), and the AotError
+      # regressions (§8.4). Do not narrow this step below --workspace without re-wiring those
+      # gates; the in-suite `a4_gate_registry_tests_exist_and_none_are_ignored` meta-test is the
+      # anti-silent-skip guard for the individual gate tests.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: no_std build (L0/L1 must build for a bare-metal target)
+        run: cargo build -p otter -p otter-wasmemit --target x86_64-unknown-none
+
+      # O-12: otter-engine's ENTIRE fail-closed story (catch_unwind in module_dispatch/tail_signal/
+      # try_dispatch) depends on panic = "unwind" — this asserts the build-time compile_error! gate in
+      # crates/otter-engine/src/lib.rs still fires under panic = "abort", so a regression (the gate text
+      # deleted, its #[cfg] condition broken, etc.) fails CI instead of silently reopening the abort-on-
+      # malformed-bytecode DoS O-12 exists to close. Isolated --target-dir: RUSTFLAGS differs from every
+      # other step in this job, so sharing a target dir would otherwise force a full rebuild each time.
+      - name: O-12 regression — panic=abort must fail to build otter-engine
+        run: |
+          if RUSTFLAGS="-C panic=abort" cargo check -p otter-engine \
+              --target-dir target/o12-panic-abort-check 2>/tmp/o12_abort.log; then
+            echo "FAIL: otter-engine compiled under panic=abort — the O-12 compile_error! guard regressed"
+            cat /tmp/o12_abort.log
+            exit 1
+          fi
+          if ! grep -q "requires panic" /tmp/o12_abort.log; then
+            echo "FAIL: build failed, but not with O-12's own message — investigate before assuming this is the expected guard"
+            cat /tmp/o12_abort.log
+            exit 1
+          fi
+          echo "OK (expected): panic=abort fails to build otter-engine, as O-12's compile_error! guard requires."
+
+      # O-12 wasm canary (upstream tripwire, panel Lens B finding — design doc §2.2 correction): otter-
+      # engine's own compile_error! gate does NOT fire when panic=unwind is explicitly requested on a
+      # target whose std lacks an unwind-capable panic runtime (wasm32-unknown-unknown, today) — the
+      # crate itself compiles/checks fine, and the failure is deferred to final-binary LINK time with an
+      # unrelated rustc message. This step asserts that link-time failure still happens. It is NOT
+      # testing otter-engine's own gate (that's the step above) — it is testing an upstream fact this
+      # crate's O-12 argument leans on. If this step ever starts SUCCEEDING, treat that as a signal to
+      # re-review the O-12 wasm argument (upstream wasm unwind-runtime support shipped), not as a
+      # regression to silence.
+      - name: O-12 wasm canary — panic=unwind must still fail to LINK on wasm32-unknown-unknown
+        run: |
+          if RUSTFLAGS="-C panic=unwind" cargo build -p otter-engine \
+              --example wasm_panic_unwind_canary --target wasm32-unknown-unknown \
+              --target-dir target/o12-wasm-canary 2>/tmp/o12_wasm.log; then
+            echo "FAIL: wasm32-unknown-unknown + panic=unwind LINKED successfully — upstream now appears"
+            echo "to support wasm unwind; the O-12 wasm argument (design doc §2.2) needs re-review, this"
+            echo "is not a regression to silently accept."
+            cat /tmp/o12_wasm.log
+            exit 1
+          fi
+          if ! grep -qi "panic_unwind\|panic strategy" /tmp/o12_wasm.log; then
+            echo "FAIL: build failed, but not with the expected panic_unwind/panic-strategy link error — investigate"
+            cat /tmp/o12_wasm.log
+            exit 1
+          fi
+          echo "OK (expected): wasm32-unknown-unknown + panic=unwind still fails to link, as the O-12 design doc §2.2 documents."
+
+  # ──────────────────── O-13 W-4: wasm-emit deployment build config lanes (design §7/§10) ────────────────────
+  # ROLE SPLIT vs the two O-12 canary steps in the `check` job above (which stay byte-for-byte
+  # unchanged):
+  #   - the O-12 canaries are TRIPWIRES: they assert that panic=unwind WITHOUT the §7 nightly
+  #     build-std pipeline still FAILS (host panic=abort must fail with O-12's own compile_error!
+  #     message; wasm32-unknown-unknown panic=unwind must still fail to LINK). They must KEEP
+  #     failing-as-expected; one of them starting to SUCCEED is an upstream-change signal to
+  #     re-review, never a red to silence.
+  #   - THESE lanes are GATES: they assert that WITH the §7 configuration (pinned nightly +
+  #     -Zbuild-std=std,panic_unwind + -Cpanic=unwind + exnref pin + --export-table/--growable-table,
+  #     wasmtime-48 host (O-16a) with wasm_exceptions(true) on gc+gc-drc features) in-wasm catch_unwind
+  #     actually WORKS (W-0 M2 smoke — the O-12 fail-closed contract holding inside wasm), the
+  #     wasm-emit cross-checks stay warning-free, and the workspace-excluded demo reaches FINAL LINK
+  #     (engine + wasmemit + otter_jit import surface, deployment-representative profile — C#7/C#8).
+  # The commands are owned by the justfile (wasm-eh-smoke / wasm-cross-check / wasm-demo-build);
+  # nightly pin + bump procedure: .claude-research-library/otter-o13-wasm-emit-design.md §7.1.
+  wasm-eh-pinned:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Stable 1.96.0 (the rust-toolchain.toml pin) drives the wasmtime host build and the
+      # cross-check lane; wasm32-wasip1 has been in the toolchain file's target list since W-3.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # W-5: the reference host is its own workspace-excluded workspace (hosts/…) — cache it
+          # alongside the root workspace or every run recompiles wasmtime+wasmtime-wasi from cold.
+          # Panel #3 C#1: the spike host (wasm-eh-smoke builds it) and the demo guest (wasm-demo-
+          # build/wasm-e2e) are ALSO their own workspace-excluded workspaces — cache them too.
+          # O-14 A-5: hosts/otter-aot-e2e is a fourth workspace-excluded workspace (wasm-aot-e2e
+          # step below). Cache impact (reviewed): one more cached wasmtime-48 native build tree,
+          # the same order as the reference host's row — it does NOT touch the demo's build-std
+          # flavors or the workspace's wasmtime-45 harness cache (separate target dirs, separate
+          # lockfiles), so no existing row is invalidated.
+          # O-16c′ L-6 (design §7 L-6 row / panel T-N3 — the L-3 comment's promised update):
+          # hosts/otter-aot-link (the b″ link driver — wasmparser/wasm-encoder/serde only, no
+          # wasmtime, small) and hosts/otter-helpers-wasm (the b′ guest library — wasm32-wasip1
+          # release + atomics flavor, small) are the fifth and sixth workspace-excluded
+          # workspaces, built by the wasm-aot-link-check / wasm-aot-component steps below.
+          # Cache impact (reviewed): both rows are tiny next to the wasmtime trees and touch
+          # nobody else's target dirs or lockfiles.
+          workspaces: |
+            .
+            hosts/otter-host-wasmtime
+            hosts/otter-aot-e2e
+            hosts/otter-aot-link
+            hosts/otter-helpers-wasm
+            spikes/o13-w0-jit-contract/host
+            demos/otter-wasm-demo
+      - uses: extractions/setup-just@v3
+
+      # O-16c′ L-3 (design otter-o16c-componentization-design.md §3.2): pinned external link
+      # tools — binaryen(wasm-merge) version_132 + wasm-tools 1.246.2, SHA-256-verified release
+      # tarballs, non-PATH explicit paths. The cache is keyed on the SHA pins THEMSELVES (read
+      # out of the justfile, the pins' single home): a pin bump changes the key ⇒ fresh
+      # download + re-verification; nothing else ever invalidates the row. Consumers landed in
+      # L-4/L-5: the wasm-aot-link-check + wasm-aot-component steps below drive the full chain
+      # through these pinned binaries on every run.
+      - name: wasm AOT link-tool pins → cache key (O-16c′ §3.2)
+        id: aot-tool-pins
+        run: echo "key=wasm-aot-tools-$(just --evaluate binaryen-sha256)-$(just --evaluate wasm-tools-sha256)" >> "$GITHUB_OUTPUT"
+      - name: Cache pinned link tools (binaryen + wasm-tools)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/neosurf/wasm-aot-tools
+          key: ${{ steps.aot-tool-pins.outputs.key }}
+      - name: wasm AOT link tools — pinned procurement (O-16c′ L-3, fail-closed SHA-256)
+        run: just wasm-aot-tools
+
+      # W-0 boundary facts (design §7 prerequisites): BOTH the rust-src component (-Zbuild-std) AND
+      # `--target wasm32-wasip1` ON THE NIGHTLY toolchain (the self-contained wasi-libc rides in the
+      # target's rust-std component) are required — without the target, build-std fails with
+      # EH-unrelated-looking link errors (crt1-command.o / -lc / -lunwind). Idempotent one-liner.
+      - name: Install pinned nightly (§7 prerequisites)
+        run: just wasm-toolchain
+
+      # O-19 C4 (design otter-o19-wasm64-design.md §3.1/§7 C4): the wasm64 T0 COMPILE canary —
+      # gate (b) of the last hard-gate item. Lives in THIS lane, not `check` (recorded): it
+      # needs the §7 pinned nightly + rust-src installed above, while the x86_64-unknown-none
+      # no_std step it parallels is stable-only. Compile canary ONLY (§1.2(b)/§9-2: the
+      # always-on guest-EXECUTION smoke was evaluated and REJECTED — nightly+build-std
+      # execution lane cost vs gate value; the S1 execution evidence is C0-persisted in
+      # otter-o19-spike-results.md, and gate (c) execution rides the stable wasm-aot-e2e step's
+      # a64-diff lane). NOT mirrored into the latest-nightly canary lane (recorded): the
+      # design's §8-2 mitigation for Tier-3 wasm64 breakage is the O-13 §7.1 bump-procedure
+      # re-confirmation item, not advance sampling — an unactionable canary red on a
+      # zero-guarantee Tier-3 target would be noise until a bump is scheduled anyway.
+      # The dedicated target dir is removed post-run so the rust-cache rows never grow a
+      # wasm64 build-std flavor (§8-6 disk discipline).
+      - name: wasm64 T0 smoke — O-19 C4 compile canary (pinned nightly, build-std)
+        run: |
+          just wasm64-smoke
+          rm -rf target/wasm64-smoke
+
+      - name: wasm EH smoke — in-wasm catch_unwind must catch (W-0 M2, integrated §7 config)
+        run: just wasm-eh-smoke
+
+      - name: wasm cross-check — otter-engine wasm-emit check + clippy on wasip1
+        run: just wasm-cross-check
+
+      - name: wasm demo final link — engine + wasmemit + otter_jit import under §7 (C#7 profile)
+        run: just wasm-demo-build
+
+      # W-5 (design §10): the §8(c) acceptance run — reference host (hosts/otter-host-wasmtime,
+      # stable + wasmtime-wasi p1) + demo guest in both feature configs, three executions
+      # (normal / --reject-compiles / --no-otter-jit+feature-off). Every §8(c) item 1-7 plus the
+      # §8(b) cross-tier differential is grep-gated, including the acceptance-5 "exactly one
+      # otter_jit.compile per hot function" accounting (HOST-COMPILE-REQUESTS/COUNT vs the
+      # guest's own expectation markers).
+      - name: wasm E2E — §8(c) acceptance items 1-7 + §8(b) cross-tier (W-5, reference host)
+        run: just wasm-e2e
+
+      # O-17 smoke gate (shared-memory L0): the atomics/shared-linear-memory variant of the demo
+      # guest (justfile `wasm-atomics-rustflags` — the spike-measured V4 recipe) through the same
+      # reference host: engine must emit the SHARED memory-import shape (cfg target_feature =
+      # "atomics") and the host must accept it (wasmtime `threads` feature +
+      # Config::shared_memory(true)). Cache impact (reviewed): this variant's units COEXIST with
+      # the wasm-e2e builds inside the demo's one target dir — cargo keys units by RUSTFLAGS
+      # (measured in the O-17 spike target dir: separate per-crate fingerprint dirs per flag
+      # set), so the existing rust-cache `workspaces` entry for demos/otter-wasm-demo already
+      # covers it and neither build invalidates the other; the cache grows by roughly one more
+      # build-std flavor (~ the same order as the feature-on/off pair wasm-e2e already caches).
+      - name: wasm E2E atomics — O-17 shared-memory L0 smoke (V4 recipe, reference host)
+        run: just wasm-e2e-atomics
+
+      # O-16f p3-bridge gate (design note otter-o16f-p3-bridge.md §7): core guest + p3-world
+      # component in ONE synchronous Store — bridge round trips pre/between/post two real
+      # otter_jit tier-ups, dual accounting (compiles + bridge calls), the §5.5 sync-latch probe,
+      # and the unwired negative probe. LANE JUDGMENT (recorded):
+      #   · BLOCKING here, despite wasmtime-wasi p3's "experimental, unstable and incomplete …
+      #     not compliant with semver" self-declaration — because the exposure is bounded by the
+      #     host's own Cargo.lock (=48.0.1) + --locked builds: the unstable surface can only move
+      #     at a DELIBERATE pin bump, exactly like every other pinned dependency (§7.1-style
+      #     discipline), so this step is deterministic, not drift-exposed. What the instability
+      #     DOES cost is recorded where it belongs: the release security-gate list (p3 declares
+      #     itself semver-exempt with no security-patch guarantee — design note §6) and the
+      #     feature-gated build (the stock host graph never compiles the p3 module).
+      #   · NOT mirrored into the latest-nightly canary lane: the only nightly-drift-exposed
+      #     machinery here is the §7 guest pipeline, which the canary already samples via
+      #     wasm-e2e/wasm-e2e-atomics; the p3 host side is stable-toolchain + pinned-lock and
+      #     gains no signal from an unpinned nightly rerun.
+      # Cache impact: host builds into its own target/p3 subdir (inside the already-cached
+      # hosts/otter-host-wasmtime workspace row — the wasm-bprime target/atomics pattern); the
+      # guest flavor coexists in the demo target dir keyed by feature set (O-17 note precedent).
+      - name: wasm E2E p3-bridge — O-16f path-12 gate (component+p1 one sync Store, tier-up live)
+        run: just wasm-e2e-p3
+
+      # O-14 A-5 (design §8.2/§9 A-5): the AOT-artifact E2E on the HOST-train shape —
+      # hosts/otter-aot-e2e (workspace-excluded, wasmtime 48, reference-host features + Config
+      # verbatim). STABLE-only (the artifact is generated at run time by compile_module — no §7
+      # nightly pipeline involved), so it lives in this lane for the host-train cache rows, not
+      # for the nightly toolchain; it is deliberately NOT mirrored into the latest-nightly canary
+      # lane (nothing in it is exposed to nightly drift). Gates: v1 argc=0 entry contract
+      # (oracle-identical), shared-memory import link, 2M-deep bounded tail recursion in a 64 KiB
+      # wasm stack, the §2.7 shared × declared-table × return_call_indirect combination, and the
+      # StackOverflow negative control.
+      - name: wasm AOT E2E — O-14 A-5 artifact gate on the 48 host shape
+        run: just wasm-aot-e2e
+
+      # ─────────── O-16c′ L-6: the M2a link + componentization chain gates (design §7 L-6) ───────────
+      # STEP-COUNT JUDGMENT (recorded): the design row names FOUR gates — wasm-aot-link-check,
+      # wasm-bprime, wasm-aot-link-e2e, wasm-aot-component — but `just` re-resolves recipe
+      # dependencies per invocation, and wasm-aot-component ⊃ wasm-aot-link-e2e ⊃ wasm-bprime ⊃
+      # wasm-aot-tools is a strict dependency chain; four separate steps would run wasm-bprime
+      # three times over. Two steps therefore cover all four gates exactly once:
+      #   1. wasm-aot-link-check — the link driver's own unit gates (fmt/clippy + the l1a/l1b/
+      #      l4/l5 suites + the L-6 mutation-ledger meta-test), wasmtime-free, fast;
+      #   2. wasm-aot-component — runs the whole chain as its dependency closure: b′ both
+      #      profiles + sidecars + B2–B5 replay (wasm-bprime), the 3-shape link chain with all
+      #      checks/probes/40k linked diff (wasm-aot-link-e2e), then embed/new + §6.2 native
+      #      checks + component execution differentials + the E10/E11 negatives.
+      # This lane and not the canary (recorded per the wasm-aot-e2e precedent above): the whole
+      # chain is STABLE-only — plain cargo under rust-toolchain.toml for b′/driver/e2e, plus the
+      # SHA-pinned external binaries procured above — so nothing in it is exposed to nightly
+      # drift; the canary lane exists for the §7 nightly build-std pipeline only. The O-W
+      # watch item (+atomics "not stably supported" warning→error flip, MODE §1.4 row 7) is
+      # sampled by wasm-bprime's stable build here on every run — a flip turns this lane red
+      # loudly, which is that watchlist entry's designed tripwire.
+      - name: wasm AOT link driver — O-16c′ unit gates (rename/marker/scratch/linked/component)
+        run: just wasm-aot-link-check
+
+      - name: wasm AOT link + component chain — O-16c′ b′×b″ E2E (AOT48-E2E-6 + -7)
+        run: just wasm-aot-component
+
+  # C#5 (W-0 disposition) second lane: LATEST-nightly canary, NON-BLOCKING. Detects upstream drift
+  # early — exnref default flip, -Zbuild-std/wasip1-EH breakage, removal of the legacy-eh LLVM
+  # option (which would turn the defensive -Cllvm-args pin into a hard error) — so a pin bump
+  # (design §7.1) can be scheduled BEFORE the pinned lane is ever forced. A red here is advance
+  # warning to run the §7.1 bump procedure; it never blocks a merge (continue-on-error).
+  wasm-eh-latest-nightly-canary:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Panel #3 C#1: every workspace-excluded crate this lane builds gets its own cache row.
+          workspaces: |
+            .
+            spikes/o13-w0-jit-contract/host
+            hosts/otter-host-wasmtime
+            demos/otter-wasm-demo
+      - uses: extractions/setup-just@v3
+
+      - name: Install latest nightly (§7 prerequisites, unpinned)
+        run: just wasm-toolchain nightly
+
+      - name: wasm EH smoke on latest nightly (drift canary)
+        run: just wasm-eh-smoke nightly
+
+      - name: wasm demo final link on latest nightly (drift canary)
+        run: just wasm-demo-build nightly
+
+      - name: wasm E2E on latest nightly (drift canary — W-5 acceptance run, unpinned guest)
+        run: just wasm-e2e nightly
+
+      # O-17 review B#1: the atomics recipe is the §7 pipeline's most drift-exposed spot (std
+      # errno TLS lowering, lld --no-check-features semantics) — without canary coverage a pin
+      # bump could force the pinned lane red with no advance warning.
+      - name: wasm atomics E2E on latest nightly (drift canary — O-17 shared-memory recipe)
+        run: just wasm-e2e-atomics nightly
+
+      - name: surface canary failure (visibility — continue-on-error hides the red)
+        if: failure()
+        run: |
+          echo "::warning title=wasm nightly canary red::latest-nightly EH smoke or demo link failed — schedule the design-doc §7.1 bump procedure"
+          echo "## :rotating_light: wasm nightly canary RED" >> "$GITHUB_STEP_SUMMARY"
+          echo "latest-nightly EH smoke or demo link failed; run the §7.1 bump procedure." >> "$GITHUB_STEP_SUMMARY"

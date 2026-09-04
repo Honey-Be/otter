@@ -1,0 +1,55 @@
+# otter-wasm-demo — O-13 §8(b)/(c) guest binary (design §9, panel C#8): the in-guest cross-tier
+# differential suite + §8(c) acceptance markers (W-5), run under the reference host
+# hosts/otter-host-wasmtime via `just wasm-e2e`. (W-4 shipped it as the first artifact proving
+# engine + wasmemit + the otter_jit import surface link end-to-end under §7.) Canonical build:
+# `just wasm-demo-build` (repo root) — see README.md here for what that expands to and why.
+
+[package]
+name = "otter-wasm-demo"
+version = "0.0.0"
+# Source stays stable-compatible (edition 2024, rust >= 1.96) — only the BUILD PIPELINE is nightly
+# (§7 / owner decision §12-1). Do not introduce nightly-only syntax/features into this crate.
+edition = "2024"
+rust-version = "1.96"
+license = "BSD-2-Clause-Patent"
+authors = ["newsniper-org"]
+publish = false
+
+# Workspace-EXCLUDED on purpose (design §9 row "otter-wasm-demo", panel C#8): this crate's
+# deliverable only builds with the §7 nightly build-std pipeline, while the workspace pins stable
+# 1.96.0 (rust-toolchain.toml). As a workspace member it would either drag nightly requirements
+# into `cargo test --workspace` or be permanently broken under the pinned stable — so it lives
+# outside `members` AND carries this empty [workspace] table, which stops cargo's upward
+# workspace-manifest discovery at this directory.
+[workspace]
+
+[dependencies]
+otter = { path = "../../crates/otter" }
+otter-engine = { path = "../../crates/otter-engine" }
+
+[features]
+# Forwards the engine's link-surface feature (design §5.1): with it, the wasm32 build imports
+# `otter_jit.compile`; without it, the binary must keep instantiating on any plain WASI runtime
+# with zero non-WASI imports ("today's T0", O-7). The §8(c)-6 feature-off regression gate is
+# `just wasm-e2e` run 3 (feature-off build + the host's --no-otter-jit mode, W-5).
+wasm-emit = ["otter-engine/wasm-emit"]
+
+# O-16f p3-bridge demo surface (design note .claude-research-library/otter-o16f-p3-bridge.md):
+# adds ONE guest import, `otter_p3.fetch_stamp(dst: *mut u64) -> i32`, and the `p3bridge` mode —
+# the guest consumes a p3-world service (WASI 0.3.0 clocks+random, reached through the reference
+# host's single-sync-Store component bridge) before/between/after otter_jit tier-ups. OFF by
+# default so every existing build/gate (wasm-e2e, wasm-e2e-atomics, wasm-demo-build) keeps the
+# frozen import surface {wasi_snapshot_preview1, otter_jit} exactly. No dependency delta — the
+# feature only gates the extern import + the mode. Gate: `just wasm-e2e-p3` (builds with
+# --features wasm-emit,p3-bridge and runs under the host's --p3-bridge mode).
+p3-bridge = []
+
+# C#7 (W-0 disposition table): deployment-REPRESENTATIVE profile. Mirrors the workspace
+# [profile.release] (opt-level 3, thin LTO, 1 codegen-unit) so what the §7 pipeline validates is
+# the build-std × exnref × representative-optimization combination — the W-0 spike guest was
+# opt-level=1/no-LTO, and closing exactly that gap is this crate's W-4 job. Keep in sync with the
+# root workspace profile.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

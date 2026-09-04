@@ -1,0 +1,31 @@
+# otter — reusable meta-VM framework workspace.
+# Extracted from the neosurf monorepo at commit 3201f32 (2026-09-04, owner directive A1):
+# standalone repository, release channels main (unstable) / testing (pre-stable).
+# hosts/ and demos/ are workspace-EXCLUDED on purpose (own lockfiles, heavy deps — wasmtime 48
+# host train vs the workspace's wasmtime-45 ↔ cranelift-0.132 lockstep harness train).
+[workspace]
+resolver = "2"
+members = [
+    "crates/otter",
+    "crates/otter-cranelift",
+    "crates/otter-baseline",
+    "crates/otter-engine",
+    "crates/otter-wasmemit",
+]
+
+[workspace.package]
+# v1.0.0-testing.1 — the first testing-channel cut (owner approval 2026-09-04). The `-testing.N`
+# pre-release identifier IS the channel marker; a stable tag drops the pre-release suffix.
+# crates.io publishing is a separate, not-yet-started track (publish = false until then).
+version = "1.0.0-testing.1"
+edition = "2024"
+rust-version = "1.96"
+license = "BSD-2-Clause-Patent"
+authors = ["newsniper-org"]
+publish = false
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.lints.rust]
+unsafe_code = "warn"          # minimize & concentrate unsafe; safe crates #![forbid]

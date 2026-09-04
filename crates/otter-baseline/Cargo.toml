@@ -1,0 +1,19 @@
+[package]
+name = "otter-baseline"
+description = "L0 baseline tier (T1) — copy-and-patch x86-64 stencil JIT for an otter ISA (microsecond compile)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+otter = { path = "../otter" }
+libc = "0.2"
+
+[dev-dependencies]
+otter-cranelift = { path = "../otter-cranelift" }

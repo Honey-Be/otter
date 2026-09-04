@@ -1,0 +1,19 @@
+[package]
+name = "otter-cranelift"
+description = "L0 backend platform shim — generic Cranelift JIT that lowers an otter ISA to host machine code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+otter = { path = "../otter" }
+cranelift-jit = "0.132"
+cranelift-module = "0.132"
+cranelift-codegen = "0.132"
+cranelift-frontend = "0.132"

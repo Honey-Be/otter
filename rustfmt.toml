@@ -1,0 +1,6 @@
+# Project formatting, enforced by `just lint` / CI (`cargo fmt --all --check`).
+# max_width = 110 matches the codebase's hand-written style (lines cluster at ≤110, far past rustfmt's
+# default of 100) so enabling fmt-check is a minimal, intent-preserving reformat rather than a rewrite.
+# Only stable options are used (toolchain is pinned to stable 1.96 — see memory runtime-rust-toolchain-config).
+max_width = 110
+edition = "2024"

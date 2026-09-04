@@ -1,0 +1,42 @@
+# O-13 (design: .claude-research-library/otter-o13-wasm-emit-design.md §9): the 4th codegen backend.
+[package]
+name = "otter-wasmemit"
+description = "L0 wasm-emit backend (Twasm) — lowers an otter ISA function to a standalone wasm module's bytes (O-13)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+otter = { path = "../otter" }
+# Pinned to the current crates.io stable line at W-1a time (0.258.0, 2026-08-24 — checked against the
+# crates.io API on 2026-09-02). default-features = false drops the component-model encoder (emitted
+# modules are core wasm only — design §5.2) — the core-module encoder is unconditional.
+wasm-encoder = { version = "0.258", default-features = false }
+# O-14 A-2 (design §2.1): the AOT pre-link artifact validator (`validate_aot_artifact`) needs the
+# raw section/payload parser (`Parser`/`Payload`, always present) to enforce the AOT whitelist and
+# the element-target-is-a-declared-table defense — no `validate`/`std`/`component-model` feature
+# needed for that. default-features = false keeps this crate no_std-clean (same rationale as
+# wasm-encoder above); the dev-dependency below re-adds the default features (`validate` for
+# `Validator`, used only by tests) — Cargo's per-target feature resolution (2024-edition default)
+# keeps that union out of the lib build the `x86_64-unknown-none` no_std check exercises.
+wasmparser = { version = "0.258", default-features = false }
+
+[dev-dependencies]
+# §8(a) native differential harness. Family 45 is LOCKED (Cargo.lock already carries
+# wasmtime-internal-core 45 as a transitive dep of cranelift-codegen 0.132 — design §5.5): bump in
+# lockstep with cranelift only. Minimal features: the W-1a harness needs compile+run only — NO
+# exception handling (design §5.5: "§8(a) 하네스 자체는 EH 불요"), so no `gc`/`gc-drc`.
+wasmtime = { version = "45", default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "std",
+] }
+# Structural assertions on the emitted bytes (§5.2 norms: section set, import shapes, NO start
+# section). Same wasm-tools release train as wasm-encoder (kept in lockstep).
+wasmparser = "0.258"

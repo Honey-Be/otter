@@ -1,0 +1,23 @@
+[package]
+name = "otter"
+description = "L0 — meta-VM generation framework (the meta-hybrid JIT toolchain): single annotated source -> multi-tier/multi-strategy VM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = ["half-codec"]
+# f16 via the `half` crate (stable; the default).
+half-codec = ["dep:half"]
+# f16 via the native `f16` primitive — NIGHTLY only; opts out of the `half` dependency. The choice
+# MUST NOT change any bytecode result (both implement IEEE binary16; a cross-config test gates this).
+f16-intrinsic = []
+
+[dependencies]
+half = { version = "2", default-features = false, optional = true }

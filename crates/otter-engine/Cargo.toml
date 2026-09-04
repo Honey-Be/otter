@@ -1,0 +1,40 @@
+[package]
+name = "otter-engine"
+description = "L0 adaptive module engine — per-function tier-up (T0 interp → T1 baseline → T2 cranelift) + cross-tier dispatch for otter function Modules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+otter = { path = "../otter" }
+
+# Optimizing tiers are target-gated so a dependent builds (and runs on T0) on targets a tier can't serve,
+# instead of failing to compile. The `#[cfg(...)]` in src/lib.rs MUST match these predicates exactly.
+# T1 (baseline) hand-emits x86-64 → x86-64 with an OS only. T2 (cranelift) → any Cranelift-capable target
+# with an OS (excludes wasm + bare-metal `none`). aarch64/riscv64 therefore get T0 + T2 (no T1).
+[target.'cfg(all(target_arch = "x86_64", not(target_os = "none")))'.dependencies]
+otter-baseline = { path = "../otter-baseline" }
+
+[target.'cfg(all(not(target_family = "wasm"), not(target_os = "none")))'.dependencies]
+otter-cranelift = { path = "../otter-cranelift" }
+
+# O-13 W-3 (design §6): the wasm-emit tier (Twasm). Target-gated like the tiers above, but
+# additionally behind the `wasm-emit` feature: unlike T1/T2, enabling this tier changes the LINK
+# SURFACE (the `otter_jit.compile` import, §5.1) — a feature-off build must keep instantiating on
+# any plain WASI runtime with zero imports beyond WASI ("today's T0", O-7 preserved; design §5.1).
+# `target_arch = "wasm32"`, NOT `target_family = "wasm"`: wasm64 would silently truncate the
+# baked scratch addresses and mismatch the §2.2 (i32,i32,i64)->i64 type (§13-3; wasm64 is T3 —
+# T0 only — per arch-support-tiers). On native targets this dependency does not exist at all, so
+# `--features wasm-emit` on x86_64 is a no-op by construction (design §5.1 / gate H).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+otter-wasmemit = { path = "../otter-wasmemit", optional = true }
+
+[features]
+# §6: pure target-gating is NOT enough for this tier — the otter_jit import surface must be opt-in.
+wasm-emit = ["dep:otter-wasmemit"]

@@ -1,0 +1,78 @@
+# otter-aot-e2e — O-14 A-5 host-train E2E gate (design
+# .claude-research-library/otter-o14-aot-core-design.md §8.2/§9 A-5): instantiates and runs
+# `compile_module` AOT artifacts on the DEPLOYMENT host shape — wasmtime family 48 with the exact
+# reference-host feature set (`runtime,cranelift,gc,gc-drc,std,threads`) and the exact reference-host
+# Config (`wasm_exceptions(true)` + `shared_memory(true)`) — closing the §2.7 [추정] gap: the
+# shared-memory-import × declared-table × `return_call_indirect` combination measured as one artifact,
+# plus the §8.2 48-train re-confirmation of the 2M-deep bounded-tail-recursion gate and its negative
+# control. Driven by `just wasm-aot-e2e` (marker-grep gated, CI wasm-eh-pinned lane).
+#
+# PLACEMENT DECISION (A-5, recorded): a NEW workspace-excluded crate, not a subcommand of
+# hosts/otter-host-wasmtime, because
+#   (1) 2-product separation (MODE §4.1): the reference host is the J-mode product's §5.1/§5.3
+#       `otter_jit.compile` contract host; this binary exercises the A-mode artifact contract. One
+#       binary per product keeps each contract's dependency set and Config surface honest.
+#   (2) lockfile hygiene: hosts/otter-host-wasmtime's Cargo.lock is the HOST-TRAIN pin authority
+#       (O-16a bump procedure) — folding otter/otter-wasmemit path deps and their churn into it
+#       would entangle the pin-bump diff with L0 development noise.
+#   (3) disjoint needs: this gate needs otter + otter-wasmemit (to GENERATE the artifact at run
+#       time — the single-lowering-source rule: no pre-emitted bytes that could silently drift from
+#       `compile_module`) and needs NO WASI, no guest file, no otter_jit wiring.
+
+[package]
+name = "otter-aot-e2e"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "BSD-2-Clause-Patent"
+authors = ["newsniper-org"]
+publish = false
+
+# Workspace-EXCLUDED like hosts/otter-host-wasmtime and demos/otter-wasm-demo (same rationale):
+# the wasmtime-48 tree must not ride into `cargo build/test --workspace` (the workspace harness is
+# pinned to family 45 via cranelift-0.132 lockstep — design §5.5; the two trains diverge by
+# design), and the empty [workspace] table stops cargo's upward discovery. Builds on the repo's
+# pinned stable (rust-toolchain.toml) — no nightly anywhere here: the artifact is generated at run
+# time by `compile_module`, not built by the §7 guest pipeline.
+[workspace]
+
+[dependencies]
+# The L0 IR + T0 oracle (`interp::run_module`) + the CANONICAL helper semantics
+# (`otter_binop`/`otter_convert`/`otter_unop`) this gate's import stubs delegate to — the same
+# single-semantics discipline every harness in crates/otter-wasmemit/tests follows.
+otter = { path = "../../crates/otter" }
+# The AOT surface under test: `compile_module` + `validate_aot_artifact` + the manifest types.
+otter-wasmemit = { path = "../../crates/otter-wasmemit" }
+# O-16c′ L-4 (design §5.5 delta / §3.1): the JSON sidecar SCHEMA single owner — `emit-aot`
+# serializes the live AotManifest through otter-aot-link's `schema` module as the PRODUCER
+# side (record==live at the schema layer: no second hand-rolled JSON truth). The dependency
+# growth (serde/serde_json/sha2 via the link crate) stays in THIS crate's own lockfile
+# (design §8-8: host-train lockfile hygiene — the reference host is untouched).
+otter-aot-link = { path = "../otter-aot-link" }
+# HOST-TRAIN pin: family 48, feature set VERBATIM from hosts/otter-host-wasmtime (the §8.2 gate is
+# defined as "the real deployment shape, as-is" — see that crate's Cargo.toml for the per-feature
+# rationale: gc+gc-drc are required by Config::wasm_exceptions(true), threads by shared-memory
+# validation). No wasmtime-wasi: the A-mode artifact imports no WASI surface at all (§2.2).
+# `component-model` (O-16c′ L-5, design §5.5 delta): the `run-component` execution mode — the
+# AOT48-E2E-7 component differential incl. the §2-4-3 host-lift wiring. Same feature set the
+# b″ spike's aotgen host used (SPK tool-version row); growth stays in THIS crate's lockfile
+# (§8-8 host-train lockfile hygiene — the reference host is untouched).
+wasmtime = { version = "48", default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "gc",
+    "gc-drc",
+    "std",
+    "threads",
+    "component-model",
+] }
+# O-19 C3 (design §4 / panel MF-1): the table64 probe vector is HAND-ENCODED (the S2 probe
+# shape verbatim) because the emitted product deliberately stays the mixed shape (table64:false,
+# §2.1) — so the encoder is a direct dependency here. Pinned to the emitter's own wasm-tools
+# train (otter-wasmemit = wasm-encoder 0.258) so the probe and the product speak one encoding
+# generation; no `wat` feature on wasmtime instead (recorded judgment: a second text-format
+# parser would be a bigger dependency than the encoder already in this crate's graph).
+wasm-encoder = { version = "0.258", default-features = false }
+
+[profile.release]
+opt-level = 2

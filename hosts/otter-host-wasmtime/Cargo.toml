@@ -1,0 +1,99 @@
+# otter-host-wasmtime — O-13 §5.5 reference host shim (design doc
+# .claude-research-library/otter-o13-wasm-emit-design.md §5): a native wasmtime-48 embedding that
+# runs an otter wasm32-wasip1 guest with real WASI preview1 wiring plus the `otter_jit.compile`
+# dynamic-compilation contract (§5.1/§5.3). This is the W-5 PRODUCT-quality successor to the W-0
+# spike host (spikes/o13-w0-jit-contract/host — kept verbatim as the committed measurement);
+# the §8(c) E2E acceptance run (`just wasm-e2e`) drives the demo guest through this binary.
+
+[package]
+name = "otter-host-wasmtime"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "BSD-2-Clause-Patent"
+authors = ["newsniper-org"]
+publish = false
+
+# Workspace-EXCLUDED like demos/otter-wasm-demo (same rationale, §9): this crate is a native-only
+# executable with a heavy dependency tree (wasmtime + wasmtime-wasi) that must not ride into
+# `cargo build/test --workspace`; the empty [workspace] table stops cargo's upward discovery.
+# It builds on the repo's pinned stable (1.96.0) — no nightly anywhere on the host side.
+[workspace]
+
+[dependencies]
+# HOST-TRAIN pin: family 48 (O-16a early bump, owner-approved 2026-09-03). The design §5.5
+# cranelift-lockstep rule governs the HARNESS side only (crates/otter-wasmemit's dev-dep
+# wasmtime 45 rides the cranelift-0.132 transitive pin and stays there until a cranelift bump);
+# this crate is workspace-excluded with its own lockfile, so the two trains diverge by design —
+# rationale + host-train bump procedure: design §5.5 (호스트 트레인 부기) / §7.1.
+# 47's removal of wasi-threads + the `wasi-common` crate is a no-op here: the host tree has zero
+# deps on either (grep + Cargo.lock verified at the O-16a bump).
+# default-features = false + the minimal set; `gc` + `gc-drc` are REQUIRED by
+# Config::wasm_exceptions(true) (the API is `gc`-feature-gated; exception objects are
+# GC-integrated — W-0 disposition A#3). Collector selection on 48 (measured, upstream config.rs):
+# Collector::Auto resolves via the compiled-in fallback chain gc-copying → gc-drc → gc-null, so
+# with `gc-drc` only it picks the DRC collector — the same collector as pin 45. `gc-copying` is
+# deliberately NOT enabled (upstream docs: the copying collector is "still under construction
+# and is not yet functional"). NOTE: wasmtime-wasi's `p1` feature chain (48: p1 → p2) enables
+# wasmtime's `async`/`component-model` features transitively — that is compile-time API surface
+# only; this shim never turns on Config::async_support and uses exclusively synchronous calls
+# (W-0 disposition A#4 — see src/main.rs). `component-model-async` is NOT in this build graph
+# (that would take wasmtime-wasi's opt-in `p3` feature — escalation research §1.6-1).
+wasmtime = { version = "48", default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "gc",
+    "gc-drc",
+    "std",
+    # O-17 L0 (shared-memory guests, design §5.2 v1.1): without this crate feature,
+    # WasmFeatures::THREADS is force-disabled (upstream config.rs: features.set(THREADS,
+    # cfg!(feature = "threads"))) and a §7-atomics guest fails Module::from_file — measured on
+    # 48: even a NON-shared guest that merely CONTAINS atomic instructions needs it ("threads
+    # support is not enabled"). With the feature, wasm_threads validation is default-ON (no
+    # Config call needed); the instantiation-side knob is Config::shared_memory (src/main.rs).
+    # Upstream marks threads tier-2 ("does not have the same guarantees", no CVEs issued) —
+    # recorded in the release security-gate list per the O-17 note.
+    "threads",
+] }
+# Real WASI preview1 wiring (design §5.5 W-5 확정): p1::add_to_linker_sync + WasiCtxBuilder.
+# Lockstep-pinned to the same family as wasmtime (the two crates version in lockstep upstream).
+wasmtime-wasi = { version = "48", default-features = false, features = ["p1"] }
+
+[features]
+# O-16f p3-bridge (design note .claude-research-library/otter-o16f-p3-bridge.md; mode doc §1.1
+# path 12 productization): OFF by default, and the default build graph is BYTE-IDENTICAL to the
+# pre-O-16f host — wasmtime-wasi's `p3` module self-declares "experimental, unstable and
+# incomplete … not compliant with semver" (48.0.1 p3/mod.rs), so it must never ride into the
+# stock reference host that the frozen §5.1 contract gates (wasm-e2e / wasm-e2e-atomics) build.
+# With the feature ON plus the `--p3-bridge` CLI flag, the host additionally instantiates a
+# p3-world demo component (imports wasi:clocks/monotonic-clock@0.3.0 + wasi:random/random@0.3.0,
+# served by `wasmtime_wasi::p3::add_to_linker`) in the SAME synchronous Store as the core guest,
+# and wires `otter_p3.fetch_stamp` as a sync bridge import that calls the component's export.
+# Feature pieces:
+#   wasmtime/component-model  — component API (already transitively ON via wasmtime-wasi p1→p2;
+#                               declared explicitly because this feature USES it directly)
+#   wasmtime/wat              — the demo component fixture is embedded as WAT (Component::new)
+#   wasmtime-wasi/p3          — the O-16a-adjudicated compile-time opt-in gate; pulls
+#                               wasmtime/component-model-async + component-model-bytes
+# Sync-Store norm (§5.5) is UNCHANGED: no async API anywhere; the S2 spike measured that 48's
+# real switch is the per-Store `async_required` one-way latch (Config::async_support is a
+# deprecated no-op) and that the sync-WIT p3 surface used here never trips it — the run()
+# post-run latch probe (HOST-P3-STORE-SYNC-OK) pins that fact in every gated run.
+# RELEASE-GATE NOTE (owner §6-4 spike-gate acceptance): the p3 module's semver exemption and
+# "bug and security fixes limited to wasip3 will not be given patch releases" self-declaration
+# mean this surface must be on the release security-gate review list for as long as the feature
+# exists (recorded in the design note §6; the =48.0.1 lockfile pin + --locked builds bound the
+# exposure to deliberate pin bumps).
+p3-bridge = ["wasmtime/component-model", "wasmtime/wat", "wasmtime-wasi/p3"]
+
+# W-0 R#3 (recorded in otter-o13-w0-spike-results.md §3): wasmtime ships its own
+# Error/Result/Context/bail (measured on 45, unchanged on 48) — this crate deliberately has NO
+# anyhow dependency (the spike host's `anyhow` line was a leftover this product crate closes out).
+
+[dev-dependencies]
+# Panel #3 lens B fix tests only: builds the §5.2 emitted-module fixtures (good shape + the
+# forbidden-section exploit shapes) for the section-whitelist unit tests in src/main.rs.
+wat = "1"
+
+[profile.release]
+opt-level = 2

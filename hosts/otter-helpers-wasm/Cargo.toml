@@ -1,0 +1,60 @@
+# otter-helpers-wasm — the b′ ENGINE-LIBRARY wasm crate of the O-16c′ M2a static-link pipeline
+# (design .claude-research-library/otter-o16c-componentization-design.md §4.1/§4.2, §7 L-2 row):
+# the spike wrapper (scratch o16c-bprime/otter-helpers-wasm) PROMOTED into the repo, source
+# essentially unchanged (path-dep made relative). Serves the three helper imports of an O-14
+# AOT artifact (`otter_helpers.{otter_binop,otter_convert,otter_unop}`, §12.3 export duty) plus
+# memory ownership — the whole of the gate-profile M2a engine library (SPK B1).
+#
+# Built by `just wasm-bprime` on the REPO-PINNED STABLE via plain `cargo` (rust-toolchain.toml
+# governs — design §4.2 panel T-S2: an explicit `cargo +1.96.0` would create a second pin
+# authority, rejected). Target wasm32-wasip1 (pinned in rust-toolchain.toml since W-3).
+#
+# PLACEMENT DECISION (design §4.1, recorded verbatim per the A-5/L-1a precedent): hosts/ is a
+# CHOICE, not a rule (the v1 "hosts/'s de-facto rule" generalization was retracted — panel
+# T-N3). Chosen because b′ is the GUEST-side half of the A-product deployment chain and belongs
+# under the same directory discipline as its pair (otter-aot-link, otter-aot-e2e) — recipe/CI
+# rule reuse is maximized. crates/ was REJECTED: workspace members share the root profile, and
+# b′ REQUIRES its own `[profile.release] panic="abort"` (profiles are root-owned — inexpressible
+# as a member); a wasm32-wasip1-only artifact also has no business riding `--workspace` builds.
+# demos/ was rejected: this is a product constituent, not a demo.
+
+[package]
+name = "otter-helpers-wasm"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "BSD-2-Clause-Patent"
+authors = ["newsniper-org"]
+publish = false
+
+[lib]
+# cdylib -> a linked, self-contained .wasm MODULE — the b″ input shape CONFIRMED by the spike
+# (SPK §4-11: staticlib/wasm-ld flat-merge mismatches the artifact's no-relocation nature; the
+# spike's "staticlib" crate-type was reference-only and is REMOVED here per design §4.1 — the
+# .a output is a dead surface once the chain input is fixed to the cdylib module).
+crate-type = ["cdylib"]
+
+[dependencies]
+# The canonical helper semantics (`otter_binop`/`otter_convert`/`otter_unop` and their whole
+# call closure — BinOp::eval/UnOp::eval/convert/NumTy/f16 codec, SPK B1). Default features
+# (= half-codec: stable f16 via `half`) — the ONLY transitive dependency is `half`.
+otter = { path = "../../crates/otter" }
+
+# b′'s own release profile (SPK recipe verbatim — the reason this crate CANNOT be a workspace
+# member, see the placement decision above): panic=abort (no EH, no unwinding — the §7
+# nightly-pin escape), opt-level=s + lto + codegen-units=1 (size), strip="debuginfo" (DWARF
+# only — the NAME section survives, which `lib-manifest --extract` requires pre-strip, §2-2).
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = "debuginfo"
+
+# Workspace-EXCLUDED (empty table stops cargo's upward discovery) — same discipline as
+# hosts/otter-aot-link: own COMMITTED Cargo.lock, `--locked` builds (design §4.2 panel M1:
+# b′ IS the gate artifact — unpinned dependency resolution would silently move the artifact
+# bytes and void the sidecar SHA binding and every L-2 re-measurement record), manual lockstep
+# with the workspace pins where crates overlap (`half` 2.x — crates/otter/Cargo.toml).
+# fmt/clippy are gated by the `just wasm-bprime` recipe (workspace-excluded ⇒ gate there).
+[workspace]

@@ -1,0 +1,76 @@
+# otter-aot-link — O-16c′ b″ link-driver crate, L-1a skeleton (design
+# .claude-research-library/otter-o16c-componentization-design.md §3.1/§5.1/§6.1, §7 L-1a row):
+# the SELF-IMPLEMENTED half of the M2a static-link chain. L-1a surface: `rename` (general
+# mapping-table over module strings / field names, import + export modes, kebab fail-closed
+# rejections — §6.1), `check --imports` (residual-import EXACT-match gate scoped to the
+# manifest's otter_host set — §5.1/§2-4), and the post-rename invariance gate (per-mode allowed
+# section — §2-6). inject-marker / check --scratch / lib-manifest are L-1b; shrink-exports /
+# check --linked are L-4 (§7, panel G-SF-5). Deterministic, no network, and NO wasmtime
+# dependency (§0-5: unit verification = wasmparser Validator; instantiation assertions moved
+# to L-4's e2e gate).
+#
+# PLACEMENT DECISION (design §3.1, recorded verbatim per the A-5 precedent): hosts/ is a
+# CHOICE, not a rule — the v1 "hosts/'s de-facto rule = workspace-excluded consumer-chain
+# crates" generalization was RETRACTED (panel T-N3: demos/otter-wasm-demo is also a
+# workspace-excluded consumer-chain crate and lives in demos/). Chosen because this crate is
+# the tool half of the A-product consumer chain and belongs next to its pair otter-aot-e2e
+# (same directory, same recipe/CI discipline — the "workspace-excluded ⇒ gate via justfile
+# recipe" rule is reused as-is). A new top-level directory was rejected as gold-plating
+# (loses the recipe/CI rule reuse).
+
+[package]
+name = "otter-aot-link"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "BSD-2-Clause-Patent"
+authors = ["newsniper-org"]
+publish = false
+
+# Workspace-EXCLUDED like hosts/otter-aot-e2e / hosts/otter-host-wasmtime (the empty
+# [workspace] table stops cargo's upward discovery). The reason here is NOT a wasmtime train
+# conflict — this crate depends on no wasmtime at all (§0-5) — but LOCKFILE HYGIENE and gate
+# LOCATION EXPLICITNESS (§3.1): serde/serde_json stay isolated in this crate's own committed
+# Cargo.lock (built with --locked), with zero ripple into the root or demos lockfiles.
+# fmt/clippy/test are gated by the `just wasm-aot-link-check` recipe (the wasm-aot-e2e
+# "workspace-excluded ⇒ gate here" rule, applied to this crate).
+[workspace]
+
+[dependencies]
+# Manifest TYPE consumption (§3.1): AotManifest/AotImport/AotImportKind are the TryFrom source
+# of the JSON sidecar schema this crate's `schema` module solely owns (§0-7 single-owner rule —
+# producers such as otter-aot-e2e path-dep THIS crate to serialize the very same types).
+otter-wasmemit = { path = "../../crates/otter-wasmemit" }
+# MANUAL LOCKSTEP with the workspace pin 0.258 (otter-wasmemit/Cargo.toml:20,28 — same
+# wasm-tools release train; §3.1). Bump ONLY together with the workspace pin.
+# `component-model` (L-5, design §6.2): the NATIVE substrate of `check --component`. It is in
+# wasmparser's DEFAULT feature set today — declared explicitly anyway so a future upstream
+# default change can never silently drop the §6.2 checks' parsing capability (fail-closed at
+# build time, not at gate time).
+wasmparser = { version = "0.258", features = ["component-model"] }
+# Same train, same lockstep. The "wasmparser" feature enables the `reencode` module
+# (TypeRef/ExternalKind conversions) used by the byte-exact single-section rewrite (§2-6:
+# import- or export-section-only rewrite, every other section byte-identical).
+wasm-encoder = { version = "0.258", features = ["wasmparser"] }
+# JSON sidecar schema layer — single owner is this crate's `schema` module (§3.1/§0-7);
+# isolated in this crate's own lockfile, no workspace ripple.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# RECORDED DESIGN DEVIATION (L-1b): sha2 is NOT in the §3.1 dependency list. It is required
+# by §2-2/§4.3 (lib-manifest --finalize computes `artifact_sha256`; inject-marker and
+# check --scratch compare the sidecar-artifact pair fail-closed). Hand-rolling SHA-256 inside
+# a fail-closed gate tool is the same over-self-implementation class §3.1 rejects for JSON
+# (and §3 rejects for sed/grep); shelling out to a PATH `sha256sum` is the silent-system-tool
+# substitution class §3.2 bans. RustCrypto sha2 is pure-Rust, deterministic, and isolated in
+# this crate's own lockfile — zero workspace ripple.
+sha2 = "0.10"
+
+[dev-dependencies]
+# O-19 C5 (the F2 schema-bridge negatives, tests/o19_c5_gates.rs): AotManifest is
+# #[non_exhaustive], so the test fixtures come from a LIVE compile_module call (then mutate
+# fields — the addrtype.rs precedent), which needs the L0 IR types. Already in this lockfile
+# transitively via otter-wasmemit — zero new lock entries.
+otter = { path = "../../crates/otter" }
+
+[profile.release]
+opt-level = 2

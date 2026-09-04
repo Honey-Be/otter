@@ -1,0 +1,3 @@
+# Build outputs only — sources and the lockfile are committed (same policy as
+# spikes/o13-w0-jit-contract: a pinned-toolchain binary crate wants a reproducible dep graph).
+/target

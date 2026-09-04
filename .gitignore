@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target
+**/target
+**/*.rs.bk
+
+# Cargo.lock IS committed (workspace has test binaries; excluded hosts own their lockfiles).
+
+# Editor / OS
+*.swp
+.DS_Store

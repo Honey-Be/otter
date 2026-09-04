@@ -1,0 +1,40 @@
+// O-16c′ §6.1 — the CANONICAL WIT world file (repo truth; the spike wit/world.wit promoted).
+//
+// `aot-artifact` is the spike-measured world VERBATIM (SPK L5): the entry's canonical ABI
+// lowering is exactly `(i32,i32,i64) -> i64` — measured to match the core `otter_entry`
+// signature bit-for-bit, so `component embed --world` + `component new` lift it with no
+// adapter. Core export names are kebab-converted first (`rename --mode export --kebab`,
+// §6.1: `_` → `-` only, fail-closed rejections ①②③).
+//
+// COMPONENT-SHAPE ENTRY CONTRACT (§6.1/§2-4, panel C-S5): a world exports functions only —
+// memory is NOT lifted and the component boundary is shared-nothing, so the O-14 §12.4
+// argc>0 args-block marshaling path structurally does not exist here. The component-shape
+// entry contract is the argc=0 v1 canonical call (or a guest-side boot function); argc>0
+// applies to the core-linked deployment shape only.
+//
+// `aot-artifact-host` is the §2-4-3 HOST-LIFT world: the residual `otter_host.*` imports of
+// a host-carrying product (gate corpus: calc — h_add7/hc_xor, the canonical Host1/HostCtx1
+// scalar shapes of O-14 §2.2) declared as component-level imports. L-5 MEASURED convention
+// (wasm-tools 1.246.2, [추정]⑤ resolved): world-level function imports bind to core imports
+// under the module string `$root` with the kebab field name — the link chain rewrites
+// `otter_host.h_add7` → `$root.h-add7` etc. with the general mapping-table `rename`
+// subcommand (zero hardcoding in the tool, §6.1/panel G-SF-2). Import lists mirror the gate
+// corpus manifest's otter_host set; a per-product WIT generation step is out of scope for
+// the gate chain (recorded caveat, design §9-2 neighborhood).
+//
+// Disposition of the non-entry core exports (recorded per the L-5 instruction): the shrink
+// keep list (memory + otter_entry + otter_table, §5.4) is unchanged; after kebab they ride
+// inside the embedded core module as `memory`/`otter-entry`/`otter-table` and are NOT
+// world-lifted (functions only; memory non-lift is §6.1 normative).
+
+package otter:aot;
+
+world aot-artifact {
+  export otter-entry: func(ctx: u32, args: u32, argc: u64) -> s64;
+}
+
+world aot-artifact-host {
+  import h-add7: func(x: s64) -> s64;
+  import hc-xor: func(host-ctx: s64, x: s64) -> s64;
+  export otter-entry: func(ctx: u32, args: u32, argc: u64) -> s64;
+}

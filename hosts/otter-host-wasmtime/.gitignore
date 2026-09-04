@@ -1,0 +1,3 @@
+# Build outputs only — sources and the lockfile are committed (same policy as
+# demos/otter-wasm-demo: a pinned-dependency binary crate wants a reproducible dep graph).
+/target

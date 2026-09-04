@@ -7,7 +7,7 @@
 //! and (c) an explicit, standalone falsification that TailCall-containing functions reach "baseline".
 
 use otter::{ArithOp, BinOp, Effect, Expr, FuncDef, Inst, Isa, Module, NumTy, OpDef, OpHints, interp};
-use otter_engine::ModuleEngine;
+use otter_engine::{ModuleEngine, NEVER};
 
 const EQ0: u16 = 0; // local[op0] = (local[op1] == 0)
 const JUMP_IF: u16 = 1; // if local[op0] != 0 goto op1
@@ -151,15 +151,15 @@ fn mutual_tail_recursion_across_two_functions_cross_tier() {
     // sanity: an even depth returns 1
     assert_eq!(interp::run_module(&isa, &module, &[1_000_000]), 1);
 
-    // T0: never promotes.
-    let t0 = ModuleEngine::new(isa.clone(), module.clone(), 10_000_000, 10_000_000);
+    // T0: never promotes (H5 interpreter_only — the pinned contract, not a "large threshold").
+    let t0 = ModuleEngine::interpreter_only(isa.clone(), module.clone());
     assert_eq!(t0.run(&[n]), oracle);
     assert_eq!(t0.tier_of(0), "interpreter");
     assert_eq!(t0.tier_of(1), "interpreter");
 
     // T1: both mutually-recursive functions must reach BASELINE — the literal falsification target of
     // O-8c-2 (T1 was permanently blocked for TailCall-containing functions before this policy landed).
-    let t1 = ModuleEngine::new(isa.clone(), module.clone(), 2, 10_000_000);
+    let t1 = ModuleEngine::new(isa.clone(), module.clone(), 2, NEVER);
     assert_eq!(t1.run(&[n]), oracle);
     assert_eq!(
         t1.tier_of(0),
@@ -277,7 +277,7 @@ fn tail_call_lands_on_a_callee_promoted_mid_flight_by_earlier_ordinary_calls() {
     // Repeat at a threshold pairing that settles BOTH functions at baseline (never crossing t2) — the
     // decisive falsification that this mixed ordinary-Call/tail-call/self-recursion shape ALSO reaches
     // T1, not only T2.
-    let eng_t1 = ModuleEngine::new(isa.clone(), module.clone(), 2, 10_000_000);
+    let eng_t1 = ModuleEngine::new(isa.clone(), module.clone(), 2, NEVER);
     for n in [50i64, 1, 0, 30, 5, 80] {
         assert_eq!(eng_t1.run(&[n]), 1777);
     }

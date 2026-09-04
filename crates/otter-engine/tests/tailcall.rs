@@ -21,7 +21,7 @@
 //! function have been REPLACED/updated accordingly — that assertion is now factually false by design.
 
 use otter::{ArithOp, BinOp, Effect, Expr, FuncDef, Inst, Isa, Module, NumTy, OpDef, OpHints, interp};
-use otter_engine::ModuleEngine;
+use otter_engine::{ModuleEngine, NEVER};
 
 const EQ0: u16 = 0;
 const JUMP_IF: u16 = 1;
@@ -132,12 +132,14 @@ fn countdown_module() -> Module {
 
 #[test]
 fn deep_tail_recursion_stays_bounded_at_t0_when_unpromoted() {
-    // Thresholds set far above the recursion depth: the function must NEVER promote (pure T0 trampoline
-    // coverage — design §6b pick T6's "T0-only" leg of the tier-separated gate). If tail calls recursed
-    // through `dispatch` (instead of looping), this overflows the native stack.
+    // T0-pinned via the H5 NEVER contract (`interpreter_only` — the old "thresholds far above the
+    // call count" idiom was never a contract, a saturating counter eventually meets any real
+    // threshold): pure T0 trampoline coverage — design §6b pick T6's "T0-only" leg of the
+    // tier-separated gate. If tail calls recursed through `dispatch` (instead of looping), this
+    // overflows the native stack.
     let isa = test_isa();
     let module = countdown_module();
-    let eng = ModuleEngine::new(isa.clone(), module.clone(), 10_000_000, 10_000_000);
+    let eng = ModuleEngine::interpreter_only(isa.clone(), module.clone());
     let oracle = interp::run_module(&isa, &module, &[1_000_000]);
     for _ in 0..3 {
         assert_eq!(eng.run(&[1_000_000]), oracle);
@@ -145,7 +147,7 @@ fn deep_tail_recursion_stays_bounded_at_t0_when_unpromoted() {
     assert_eq!(
         eng.tier_of(0),
         "interpreter",
-        "unpromoted by design (t1/t2 far above the call count)"
+        "unpromoted by contract (interpreter_only — H5 NEVER)"
     );
 }
 
@@ -184,9 +186,9 @@ fn deep_tail_recursion_promotes_to_cranelift_and_stays_bounded() {
 fn deep_tail_recursion_promotes_to_baseline_and_stays_bounded() {
     let isa = test_isa();
     let module = countdown_module();
-    // Low t1, t2 far above: promotes to baseline within the first few trampoline iterations, then NEVER
-    // reaches t2 (far above the 1,000,000-deep recursion), so it settles at T1 for the whole run.
-    let eng = ModuleEngine::new(isa.clone(), module.clone(), 2, 10_000_000);
+    // Low t1, t2 opted out (H5 NEVER — a real T1 cap, not a "large threshold"): promotes to baseline
+    // within the first few trampoline iterations, then can never reach T2, so it settles at T1.
+    let eng = ModuleEngine::new(isa.clone(), module.clone(), 2, NEVER);
     let oracle = interp::run_module(&isa, &module, &[1_000_000]);
     for _ in 0..3 {
         assert_eq!(
@@ -415,8 +417,8 @@ fn cross_tier_differential_pure_tail_recursion() {
     let oracle = interp::run_module(&isa, &module, &[n]);
     assert_eq!(oracle, 42);
 
-    // T0: thresholds set far above what even 5,000 tail steps can cross — stays interpreted throughout.
-    let t0 = ModuleEngine::new(isa.clone(), module.clone(), 10_000_000, 10_000_000);
+    // T0: pinned by contract (H5 interpreter_only) — stays interpreted at any call count.
+    let t0 = ModuleEngine::interpreter_only(isa.clone(), module.clone());
     assert_eq!(t0.run(&[n]), oracle, "T0 engine result must match the oracle");
     assert_eq!(
         t0.tier_of(0),
@@ -424,8 +426,8 @@ fn cross_tier_differential_pure_tail_recursion() {
         "t0-forced engine must have stayed T0"
     );
 
-    // T1: low t1, t2 far above — settles at baseline.
-    let t1 = ModuleEngine::new(isa.clone(), module.clone(), 2, 10_000_000);
+    // T1: low t1, t2 opted out (H5 NEVER) — settles at baseline.
+    let t1 = ModuleEngine::new(isa.clone(), module.clone(), 2, NEVER);
     assert_eq!(t1.run(&[n]), oracle, "T1 engine result must match the oracle");
     assert_eq!(
         t1.tier_of(0),
@@ -461,8 +463,8 @@ fn cross_tier_differential_mixed_call_and_tailcall_graph() {
     // call (it tail-recurses through all of n..=0), so it crosses every threshold below on the FIRST call.
     const CALLS: usize = 5;
 
-    // T0: thresholds far above what 5 calls (or 500 tail steps) can cross.
-    let t0 = ModuleEngine::new(isa.clone(), module.clone(), 10_000_000, 10_000_000);
+    // T0: pinned by contract (H5 interpreter_only).
+    let t0 = ModuleEngine::interpreter_only(isa.clone(), module.clone());
     for _ in 0..CALLS {
         assert_eq!(t0.run(&[n]), oracle, "T0 engine result must match the oracle");
     }
@@ -477,8 +479,8 @@ fn cross_tier_differential_mixed_call_and_tailcall_graph() {
         "t0-forced: helper must have stayed T0"
     );
 
-    // T1: low t1, t2 far above — both functions settle at baseline.
-    let t1 = ModuleEngine::new(isa.clone(), module.clone(), 2, 10_000_000);
+    // T1: low t1, t2 opted out (H5 NEVER) — both functions settle at baseline.
+    let t1 = ModuleEngine::new(isa.clone(), module.clone(), 2, NEVER);
     for _ in 0..CALLS {
         assert_eq!(t1.run(&[n]), oracle, "T1 engine result must match the oracle");
     }

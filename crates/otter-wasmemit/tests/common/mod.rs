@@ -253,6 +253,30 @@ pub fn isa() -> Isa {
     Isa { ops }
 }
 
+/// Every function body's decoded operator list (wasmparser `{:?}` strings), in code-section order —
+/// promoted here from `aot.rs` at H4 so the opcode-inventory gate reuses the SAME parser as the
+/// trampoline-adjacency assertions (no second body-walker to drift).
+pub fn all_body_ops(bytes: &[u8]) -> Vec<Vec<String>> {
+    use wasmparser::{Parser, Payload};
+    let mut bodies = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        if let Payload::CodeSectionEntry(body) = payload.expect("parse") {
+            let mut ops = Vec::new();
+            let mut reader = body.get_operators_reader().expect("operators");
+            while !reader.eof() {
+                ops.push(format!("{:?}", reader.read().expect("operator")));
+            }
+            bodies.push(ops);
+        }
+    }
+    bodies
+}
+
+/// The decoded operator list of function body `j` (for the trampoline-adjacency assertions).
+pub fn body_ops(bytes: &[u8], j: usize) -> Vec<String> {
+    all_body_ops(bytes).swap_remove(j)
+}
+
 /// A [`FuncDef`] with no consts (the common case in these tests).
 pub fn func(nparams: usize, nlocals: usize, code: Vec<Inst>) -> FuncDef {
     FuncDef {

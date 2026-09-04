@@ -54,7 +54,7 @@ mod common;
 use std::cell::{Cell, RefCell};
 
 use common::{
-    CALL, HALT, HOST1, HOST2, HOSTCTX2, JUMP_IF, MOV_IMM, RET, TAILCALL, bin_opcode, func, gen_cfg,
+    CALL, HALT, HOST1, HOST2, HOSTCTX2, JUMP_IF, MOV_IMM, RET, TAILCALL, bin_opcode, body_ops, func, gen_cfg,
     gen_straightline, lcg, neg_opcode, oracle,
 };
 use otter::interp::run_module;
@@ -246,21 +246,8 @@ fn bodies_with_ty_imm_offsets(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<usize>)> {
     out
 }
 
-/// The decoded operator list of function body `j` (for the trampoline-adjacency assertions).
-fn body_ops(bytes: &[u8], j: usize) -> Vec<String> {
-    let mut bodies = Vec::new();
-    for payload in Parser::new(0).parse_all(bytes) {
-        if let Payload::CodeSectionEntry(body) = payload.expect("parse") {
-            let mut ops = Vec::new();
-            let mut reader = body.get_operators_reader().expect("operators");
-            while !reader.eof() {
-                ops.push(format!("{:?}", reader.read().expect("operator")));
-            }
-            bodies.push(ops);
-        }
-    }
-    bodies.swap_remove(j)
-}
+// (H4) `body_ops` — the decoded operator list of function body `j` — moved to `tests/common`
+// (`common::body_ops`), so the opcode-inventory gate reuses this same parser instead of a copy.
 
 /// Raw content bytes of the table section and the element section (for the entry-invariance
 /// comparison — neither depends on `m.entry`).

@@ -52,6 +52,57 @@ fn disp(i: usize) -> i32 {
     -(((i + 1) * 8) as i32)
 }
 
+/// H2 — control-flow-enforcement landing pad emitted at the head of BOTH T1 prologues
+/// (`emit_fn` / `emit_module_func`). `endbr64` (`F3 0F 1E FA`) is a NOP on non-CET CPUs and the
+/// only legal indirect-branch target on CET-enabled ones; every internal `rel32` in this backend
+/// is patched from `code.len()` (never a hand-counted absolute), so prepending these 4 bytes is
+/// transparent to the rest of emission. See design §H2.
+const ENDBR64: [u8; 4] = [0xF3, 0x0F, 0x1E, 0xFA];
+
+/// H1b — the guard-page size the large-frame probe strides in. A frame this size or smaller
+/// cannot skip the (>= 1 page, guardsize(0) embedders excepted) guard, so no probe is emitted.
+/// `frame == 4096` is a benign tier asymmetry: T1 emits NO probe (strictly-greater here) while T2's
+/// inline probestack rounds to `probe_count = 1` — both are safe under the >= 1-page guard assumption.
+const PROBE_PAGE: i32 = 4096;
+
+/// H1b — T1 large-frame stack probe (design §H1b, confirmed byte sequence). For `frame > 4096`,
+/// walk the frame in 4096-byte strides with a **sub-then-touch** sequence — mirroring Cranelift's
+/// inline probestack (`gen_inline_probestack`) — emitted *before* the real `sub rsp, frame`, so a
+/// guard-page fault happens during this controlled probe rather than mid-spill (the module path's
+/// first frame write spills `rdi/rsi/rdx` at the deepest slots — the silent-corruption window this
+/// seals). Never touches memory below `rsp` (kernel stack-growth heuristic / valgrind / wasmtime#7454).
+///
+/// Scratch is **`rcx` only**: `rdi/rsi/rdx` carry the SysV args live at prologue time (the module
+/// path spills them only *after* the probe) and `rax` is used by the immediately-following init, so
+/// none may be clobbered. The existing `sub rsp, frame` bytes are unchanged — this is pure prefix.
+///
+/// `npages = frame / 4096` (floor): `<= 4` unrolls, `> 4` loops. The trailing `add rsp, npages*4096`
+/// restores `rsp` so the real `sub rsp, frame` allocates exactly as before.
+fn emit_frame_probe(code: &mut Vec<u8>, frame: i32) {
+    if frame <= PROBE_PAGE {
+        return;
+    }
+    let npages = (frame / PROBE_PAGE) as u32; // floor — full guard pages spanned
+    const SUB_PAGE: [u8; 7] = [0x48, 0x81, 0xEC, 0x00, 0x10, 0x00, 0x00]; // sub rsp, 4096
+    const TOUCH: [u8; 7] = [0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00]; // mov dword [rsp], 0
+    if npages <= 4 {
+        for _ in 0..npages {
+            emit(code, &SUB_PAGE);
+            emit(code, &TOUCH);
+        }
+    } else {
+        emit(code, &[0xB9]); // mov ecx, npages
+        emit_i32(code, npages as i32);
+        // .L: (loop body is exactly 18 bytes, so the `jnz` rel8 back to .L is -18 = 0xEE)
+        emit(code, &SUB_PAGE); // sub rsp, 4096
+        emit(code, &TOUCH); // mov dword [rsp], 0
+        emit(code, &[0xFF, 0xC9]); // dec ecx
+        emit(code, &[0x75, 0xEE]); // jnz .L
+    }
+    emit(code, &[0x48, 0x81, 0xC4]); // add rsp, npages*4096
+    emit_i32(code, npages as i32 * PROBE_PAGE);
+}
+
 /// Integer binop operand setup: with rhs in `rax` and lhs on the stack → `rcx = rhs`, `rax = lhs`.
 fn setup_int(code: &mut Vec<u8>) {
     emit(code, &[0x48, 0x89, 0xC1]); // mov rcx, rax  (rhs)
@@ -409,13 +460,26 @@ fn emit_expr(code: &mut Vec<u8>, inst: &Inst, host_ctx: Value, e: &Expr) {
 /// `otter::interp::interpret_from`'s doc for the matching interpreter-tier decision this mirrors, and
 /// `otter_cranelift::compile_fn`'s doc for the T2 sibling of this same decision.
 pub fn compile(isa: &Isa, prog: &[Inst], nlocals: usize, nargs: usize) -> BaselineCode {
+    let code = emit_fn(isa, prog, nlocals, nargs);
+    // SAFETY: `code` is well-formed host machine code for `extern "C" fn(*const i64) -> i64`.
+    let buf = unsafe { ExecBuf::map(&code) };
+    BaselineCode { buf, nargs }
+}
+
+/// The pure-emission half of [`compile`] (H1b: `compile = emit + map`, release behavior unchanged).
+/// Returns the finished machine-code bytes *before* they are mapped executable, so the golden /
+/// structural gates can inspect them address-free (this single-function path bakes only deterministic
+/// program constants via `movabs`, never a runtime address — as long as `prog` is helper/host-free).
+fn emit_fn(isa: &Isa, prog: &[Inst], nlocals: usize, nargs: usize) -> Vec<u8> {
     const HOST_CTX: Value = 0;
     let mut code: Vec<u8> = Vec::with_capacity(64 + prog.len() * 24);
 
-    // prologue: push rbp; mov rbp,rsp; sub rsp, frame
+    // prologue: endbr64 (H2); push rbp; mov rbp,rsp; [large-frame probe (H1b)]; sub rsp, frame
+    emit(&mut code, &ENDBR64);
     emit(&mut code, &[0x55]);
     emit(&mut code, &[0x48, 0x89, 0xE5]);
     let frame = ((nlocals * 8).div_ceil(16) * 16) as i32; // 16-byte aligned
+    emit_frame_probe(&mut code, frame);
     emit(&mut code, &[0x48, 0x81, 0xEC]);
     emit_i32(&mut code, frame);
 
@@ -483,10 +547,7 @@ pub fn compile(isa: &Isa, prog: &[Inst], nlocals: usize, nargs: usize) -> Baseli
             i32::try_from(rel).expect("branch displacement out of i32 range"),
         );
     }
-
-    // SAFETY: `code` is well-formed host machine code for `extern "C" fn(*const i64) -> i64`.
-    let buf = unsafe { ExecBuf::map(&code) };
-    BaselineCode { buf, nargs }
+    code
 }
 
 // --- W^X executable buffer --------------------------------------------------------------------------
@@ -716,6 +777,16 @@ fn emit_aligned_call_rax(code: &mut Vec<u8>) {
 }
 
 fn compile_module_func(isa: &Isa, f: &FuncDef, fill: Value, host_ctx: Value, call_mode: CallMode) -> ExecBuf {
+    let code = emit_module_func(isa, f, fill, host_ctx, call_mode);
+    // SAFETY: `code` is well-formed host machine code for the `ModuleEntry` signature.
+    unsafe { ExecBuf::map(&code) }
+}
+
+/// The pure-emission half of [`compile_module_func`] (H1b: `compile = emit + map`, release behavior
+/// unchanged) — the module-path sibling of [`emit_fn`]. Returns the finished bytes before mapping so the
+/// golden / structural gates can inspect them; `CallMode::Dispatch` bakes the dispatcher/tail addresses
+/// as immediates, so only the `CallMode::Table` product is fully address-free.
+fn emit_module_func(isa: &Isa, f: &FuncDef, fill: Value, host_ctx: Value, call_mode: CallMode) -> Vec<u8> {
     let nlocals = f.nlocals;
     let prog = &f.code;
 
@@ -753,9 +824,11 @@ fn compile_module_func(isa: &Isa, f: &FuncDef, fill: Value, host_ctx: Value, cal
 
     let mut code: Vec<u8> = Vec::with_capacity(64 + prog.len() * 28);
 
-    // prologue
+    // prologue: endbr64 (H2); push rbp; mov rbp,rsp; [large-frame probe (H1b)]; sub rsp, frame
+    emit(&mut code, &ENDBR64);
     emit(&mut code, &[0x55]); // push rbp
     emit(&mut code, &[0x48, 0x89, 0xE5]); // mov rbp, rsp
+    emit_frame_probe(&mut code, frame); // H1b: probe BEFORE the spill window (design §H1b)
     emit(&mut code, &[0x48, 0x81, 0xEC]); // sub rsp, frame
     emit_i32(&mut code, frame);
     // spill the ABI registers
@@ -937,9 +1010,7 @@ fn compile_module_func(isa: &Isa, f: &FuncDef, fill: Value, host_ctx: Value, cal
             i32::try_from(rel).expect("branch displacement out of i32 range"),
         );
     }
-
-    // SAFETY: `code` is well-formed host machine code for the `ModuleEntry` signature.
-    unsafe { ExecBuf::map(&code) }
+    code
 }
 
 /// The copy-and-patch baseline JIT as an [`otter::engine::Backend`] — the T1 tier of the engine.
@@ -958,7 +1029,431 @@ impl Backend for BaselineBackend {
 mod tests {
     use super::*;
     use otter::interp::{interpret, interpret_with};
-    use otter::sample::{self, ADD, HALT, LT, MOV_IMM, MUL, SUB};
+    use otter::sample::{self, ADD, HALT, JUMP, JUMP_IF, LT, MOV_IMM, MUL, SUB};
+
+    // =============================================================================================
+    // H-package (ship-hardening) emission-side gates — H2 (endbr64) + H1b (large-frame probe).
+    //
+    // MUTATION LEDGER (design §H1b/§H2 "뮤테이션 비공허성"). Each row is a way to break the emitter;
+    // the named assertion is where the corresponding gate goes RED. Non-vacuity of these gates was
+    // demonstrated for T1 (probe removal) by actually applying the mutation, observing the failure,
+    // and reverting — see the implementer's report.
+    //
+    //   Mutation                                  | Killed by
+    //   ------------------------------------------|-------------------------------------------------
+    //   Probe removed (emit_frame_probe → no-op)  | prologue_probe_structure_and_boundaries:
+    //                                             |   "probe present iff frame > 4096"
+    //                                             | large_frame_executes_correctly (may also fault)
+    //   Stride widened 4096 → 8192                | prologue_probe_structure_and_boundaries —
+    //                                             |   unroll form: parser does not recognize the
+    //                                             |     8192-sub as a probe → "frame immediate"
+    //                                             |     mismatch; loop form: "each per-page sub <= 4096"
+    //   Order reversed (touch-then-sub)           | prologue_probe_structure_and_boundaries:
+    //                                             |   parse_prologue "sub rsp, frame" / probe-detect
+    //   endbr64 removed (drop ENDBR64 prefix)     | endbr64_at_head_of_every_emitted_function
+    //                                             | golden_small_frame_bytes_stable
+    //   Restore skipped / wrong add imm           | prologue_probe_structure_and_boundaries:
+    //                                             |   "accumulated probe == restore == npages*4096"
+    //   Small-frame emission drift (any prologue) | golden_small_frame_bytes_stable
+    //
+    // (The H1c flag-removal mutations live in the otter-cranelift ledger.)
+    // =============================================================================================
+
+    /// Address-free golden program (design §H1b: pure int ALU + jmp/halt, no host/helper calls →
+    /// `movabs` bakes only deterministic program constants, never a runtime address).
+    fn golden_program() -> Vec<Inst> {
+        vec![
+            Inst::new(MOV_IMM, 0, 5, 0), // r0 = 5
+            Inst::new(MOV_IMM, 1, 3, 0), // r1 = 3
+            Inst::new(ADD, 2, 0, 1),     // r2 = r0 + r1 = 8
+            Inst::new(SUB, 3, 2, 1),     // r3 = r2 - r1 = 5
+            Inst::new(MUL, 4, 3, 1),     // r4 = r3 * r1 = 15
+            Inst::new(LT, 5, 1, 4),      // r5 = r1 < r4 = 1
+            Inst::new(JUMP_IF, 5, 8, 0), // if r5 goto 8 (taken)
+            Inst::new(MUL, 4, 4, 4),     // (skipped) r4 = r4*r4
+            Inst::new(JUMP, 9, 0, 0),    // goto 9
+            Inst::new(HALT, 4, 0, 0),    // return r4 = 15
+        ]
+    }
+
+    /// Golden: the FULL emitted bytes of [`golden_program`] at `nlocals=6` (frame = 48, a small
+    /// frame ⇒ NO probe). Captured with the H2 `endbr64` prefix in place; the H1b change must leave
+    /// this byte-identical (small-frame invariance). A drift here is an intentional emission change
+    /// and must be re-captured deliberately (rerun the removed `_dump_golden` helper). Head bytes:
+    /// `F3 0F 1E FA` (endbr64) · `55` (push rbp) · `48 89 E5` (mov rbp,rsp) · `48 81 EC 30 00 00 00`
+    /// (sub rsp, 0x30) — no `48 81 EC 00 10 00 00` / `C7 04 24 ...` probe pair.
+    #[rustfmt::skip]
+    const GOLDEN_SMALL_FRAME: [u8; 292] = [
+        0xF3, 0x0F, 0x1E, 0xFA, 0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 0x30,
+        0x00, 0x00, 0x00, 0x48, 0xC7, 0x85, 0xF8, 0xFF, 0xFF, 0xFF, 0x00, 0x00,
+        0x00, 0x00, 0x48, 0xC7, 0x85, 0xF0, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00,
+        0x00, 0x48, 0xC7, 0x85, 0xE8, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0xC7, 0x85, 0xE0, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x48,
+        0xC7, 0x85, 0xD8, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x48, 0xC7,
+        0x85, 0xD0, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x48, 0xC7, 0xC0,
+        0x05, 0x00, 0x00, 0x00, 0x48, 0x89, 0x85, 0xF8, 0xFF, 0xFF, 0xFF, 0x48,
+        0xC7, 0xC0, 0x03, 0x00, 0x00, 0x00, 0x48, 0x89, 0x85, 0xF0, 0xFF, 0xFF,
+        0xFF, 0x48, 0x8B, 0x85, 0xF8, 0xFF, 0xFF, 0xFF, 0x50, 0x48, 0x8B, 0x85,
+        0xF0, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0xC1, 0x58, 0x48, 0x01, 0xC8, 0x48,
+        0x89, 0x85, 0xE8, 0xFF, 0xFF, 0xFF, 0x48, 0x8B, 0x85, 0xE8, 0xFF, 0xFF,
+        0xFF, 0x50, 0x48, 0x8B, 0x85, 0xF0, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0xC1,
+        0x58, 0x48, 0x29, 0xC8, 0x48, 0x89, 0x85, 0xE0, 0xFF, 0xFF, 0xFF, 0x48,
+        0x8B, 0x85, 0xE0, 0xFF, 0xFF, 0xFF, 0x50, 0x48, 0x8B, 0x85, 0xF0, 0xFF,
+        0xFF, 0xFF, 0x48, 0x89, 0xC1, 0x58, 0x48, 0x0F, 0xAF, 0xC1, 0x48, 0x89,
+        0x85, 0xD8, 0xFF, 0xFF, 0xFF, 0x48, 0x8B, 0x85, 0xF0, 0xFF, 0xFF, 0xFF,
+        0x50, 0x48, 0x8B, 0x85, 0xD8, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0xC1, 0x58,
+        0x48, 0x39, 0xC8, 0x0F, 0x9C, 0xC0, 0x0F, 0xB6, 0xC0, 0x48, 0x89, 0x85,
+        0xD0, 0xFF, 0xFF, 0xFF, 0x48, 0x8B, 0x85, 0xD0, 0xFF, 0xFF, 0xFF, 0x48,
+        0x85, 0xC0, 0x0F, 0x85, 0x1E, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x85, 0xD8,
+        0xFF, 0xFF, 0xFF, 0x50, 0x48, 0x8B, 0x85, 0xD8, 0xFF, 0xFF, 0xFF, 0x48,
+        0x89, 0xC1, 0x58, 0x48, 0x0F, 0xAF, 0xC1, 0x48, 0x89, 0x85, 0xD8, 0xFF,
+        0xFF, 0xFF, 0xE9, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x85, 0xD8, 0xFF,
+        0xFF, 0xFF, 0xC9, 0xC3,
+    ];
+
+    /// Consts-only ALU module function for the Table-mode golden (R5a): `nparams = 0`, so the
+    /// consts `[5, -3]` land in slots 0..2; pure ALU + HALT — no Call/host/f16 helpers, so
+    /// `CallMode::Table` bakes NO runtime address and every `movabs` is a deterministic program
+    /// constant (`fill` + the two consts).
+    fn table_golden_func() -> FuncDef {
+        FuncDef {
+            nparams: 0,
+            consts: vec![5, -3],
+            nlocals: 5,
+            code: vec![
+                Inst::new(ADD, 2, 0, 1), // r2 = 5 + (-3) = 2
+                Inst::new(MUL, 3, 2, 0), // r3 = r2 * 5 = 10
+                Inst::new(SUB, 4, 3, 1), // r4 = r3 - (-3) = 13
+                Inst::new(HALT, 4, 0, 0),
+            ],
+        }
+    }
+
+    // --- H1b prologue parser (structural gate) ---------------------------------------------------
+
+    const SUB_PAGE_BYTES: [u8; 7] = [0x48, 0x81, 0xEC, 0x00, 0x10, 0x00, 0x00]; // sub rsp, 4096
+    const TOUCH_BYTES: [u8; 7] = [0xC7, 0x04, 0x24, 0x00, 0x00, 0x00, 0x00]; // mov dword [rsp], 0
+
+    #[derive(Debug)]
+    struct ProbeShape {
+        loop_form: bool,
+        npages: u32,
+        /// Per-page `sub rsp, X` immediates (unroll: one per page; loop: the single body sub).
+        subs: Vec<u32>,
+        touches: usize,
+        /// `add rsp, X` restore immediate.
+        restore: u32,
+        /// Byte offset of the first page touch (`C7 04 24 ...`).
+        first_touch_off: usize,
+    }
+
+    #[derive(Debug)]
+    struct Prologue {
+        endbr64: bool,
+        frame: u32,
+        probe: Option<ProbeShape>,
+        /// Byte offset of the real `sub rsp, frame`.
+        real_sub_off: usize,
+    }
+
+    fn rd_u32(code: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
+    }
+
+    /// Byte-level parser for the fixed T1 prologue head: `endbr64`; `push rbp`; `mov rbp,rsp`;
+    /// optional H1b probe; `sub rsp, frame`. It asserts the invariant framing and returns the probe
+    /// shape (if any) so the structural gate can check design §H1b's properties.
+    fn parse_prologue(code: &[u8]) -> Prologue {
+        let mut p = 0usize;
+        let endbr64 = code[0..4] == ENDBR64;
+        assert!(endbr64, "prologue must start with endbr64 (H2)");
+        p += 4;
+        assert_eq!(code[p], 0x55, "expected push rbp");
+        p += 1;
+        assert_eq!(&code[p..p + 3], &[0x48, 0x89, 0xE5], "expected mov rbp,rsp");
+        p += 3;
+
+        let probe = if code[p] == 0xB9 {
+            // loop form: mov ecx,npages; .L: sub rsp,4096; mov [rsp],0; dec ecx; jnz .L; add rsp,imm
+            let npages = rd_u32(code, p + 1);
+            p += 5;
+            assert_eq!(code[p], 0x48, "loop probe: sub rsp,imm opcode");
+            assert_eq!(code[p + 1], 0x81, "loop probe: sub rsp,imm opcode");
+            assert_eq!(code[p + 2], 0xEC, "loop probe: sub rsp,imm modrm");
+            let sub = rd_u32(code, p + 3);
+            p += 7;
+            let first_touch_off = p;
+            assert_eq!(&code[p..p + 7], &TOUCH_BYTES, "loop probe: page touch");
+            p += 7;
+            assert_eq!(&code[p..p + 2], &[0xFF, 0xC9], "loop probe: dec ecx");
+            p += 2;
+            assert_eq!(&code[p..p + 2], &[0x75, 0xEE], "loop probe: jnz .L (rel8 -18)");
+            p += 2;
+            assert_eq!(
+                &code[p..p + 3],
+                &[0x48, 0x81, 0xC4],
+                "loop probe: add rsp,imm restore"
+            );
+            let restore = rd_u32(code, p + 3);
+            p += 7;
+            Some(ProbeShape {
+                loop_form: true,
+                npages,
+                subs: vec![sub],
+                touches: 1,
+                restore,
+                first_touch_off,
+            })
+        } else if p + 14 <= code.len()
+            && code[p..p + 7] == SUB_PAGE_BYTES
+            && code[p + 7..p + 14] == TOUCH_BYTES
+        {
+            // unroll form: (sub rsp,4096; mov [rsp],0) x k; add rsp, k*4096
+            let mut subs = Vec::new();
+            let mut touches = 0usize;
+            let mut first_touch_off = 0usize;
+            // a page pair is `48 81 EC <imm32>` immediately followed by the touch (the real frame
+            // `sub rsp, frame` is NEVER followed by a touch, so this disambiguates the probe's end).
+            while p + 14 <= code.len()
+                && code[p] == 0x48
+                && code[p + 1] == 0x81
+                && code[p + 2] == 0xEC
+                && code[p + 7..p + 14] == TOUCH_BYTES
+            {
+                subs.push(rd_u32(code, p + 3));
+                p += 7;
+                if touches == 0 {
+                    first_touch_off = p;
+                }
+                touches += 1;
+                p += 7;
+            }
+            assert_eq!(
+                &code[p..p + 3],
+                &[0x48, 0x81, 0xC4],
+                "unroll probe: add rsp,imm restore"
+            );
+            let restore = rd_u32(code, p + 3);
+            p += 7;
+            Some(ProbeShape {
+                loop_form: false,
+                npages: subs.len() as u32,
+                subs,
+                touches,
+                restore,
+                first_touch_off,
+            })
+        } else {
+            None
+        };
+
+        let real_sub_off = p;
+        assert_eq!(&code[p..p + 3], &[0x48, 0x81, 0xEC], "expected sub rsp, frame");
+        let frame = rd_u32(code, p + 3);
+        Prologue {
+            endbr64,
+            frame,
+            probe,
+            real_sub_off,
+        }
+    }
+
+    /// Assert design §H1b's structural properties for a parsed prologue at a given expected `frame`.
+    fn assert_probe_invariants(pro: &Prologue, expected_frame: u32) {
+        assert!(pro.endbr64);
+        assert_eq!(pro.frame, expected_frame, "frame immediate");
+        if expected_frame > PROBE_PAGE as u32 {
+            let probe = pro.probe.as_ref().expect("probe present iff frame > 4096");
+            let npages = expected_frame / PROBE_PAGE as u32;
+            assert_eq!(probe.npages, npages, "npages == frame / 4096 (floor)");
+            assert!(probe.touches >= 1, "at least one page touch");
+            assert!(
+                probe.subs.iter().all(|&s| s <= PROBE_PAGE as u32),
+                "each per-page sub <= 4096 (got {:?})",
+                probe.subs
+            );
+            // accumulated probe distance == restore == npages*4096 (consistency)
+            let probed: u64 = if probe.loop_form {
+                npages as u64 * probe.subs[0] as u64
+            } else {
+                probe.subs.iter().map(|&s| s as u64).sum()
+            };
+            assert_eq!(probed, probe.restore as u64, "accumulated probe == restore");
+            assert_eq!(
+                probe.restore,
+                npages * PROBE_PAGE as u32,
+                "restore == npages*4096"
+            );
+            assert_eq!(probe.loop_form, npages > 4, "unroll iff npages <= 4");
+            // silent-corruption window sealed: the first frame write (probe touch) precedes the real
+            // `sub rsp, frame` (and therefore every spill/init, which the emitter places after it).
+            assert!(
+                probe.first_touch_off < pro.real_sub_off,
+                "first memory store (probe touch @ {}) must precede the real frame sub @ {}",
+                probe.first_touch_off,
+                pro.real_sub_off
+            );
+        } else {
+            assert!(pro.probe.is_none(), "no probe for frame <= 4096");
+        }
+    }
+
+    /// A call-free module function of `nlocals` locals (its frame = ceil((nlocals+3)*8 / 16)*16 with
+    /// `maxargc=0`) — the module-path counterpart to a single function's `nlocals`.
+    fn module_func(nlocals: usize) -> FuncDef {
+        FuncDef {
+            nparams: 0,
+            consts: vec![],
+            nlocals,
+            code: vec![Inst::new(HALT, 0, 0, 0)],
+        }
+    }
+
+    #[test]
+    fn golden_small_frame_bytes_stable() {
+        let isa = sample::isa();
+        let code = emit_fn(&isa, &golden_program(), 6, 0);
+        assert_eq!(
+            code.as_slice(),
+            &GOLDEN_SMALL_FRAME[..],
+            "small-frame emission drifted (H2 endbr64 + no-probe invariant); re-capture deliberately"
+        );
+    }
+
+    /// Golden: the FULL emitted bytes of [`table_golden_func`] under `CallMode::Table` at
+    /// `fill = 0`, `host_ctx = 0` (frame = 64 — small frame ⇒ NO probe). The MODULE-path sibling
+    /// of [`GOLDEN_SMALL_FRAME`]: Table mode is the only fully address-free module product
+    /// (`CallMode::Dispatch` bakes dispatcher/tail addresses), so its bytes are deterministic —
+    /// the three `movabs` are `fill` (0), const 5, and const −3. Same re-capture discipline as
+    /// [`GOLDEN_SMALL_FRAME`] (a drift is an intentional emission change; re-capture deliberately).
+    /// Head bytes: `F3 0F 1E FA` (endbr64) · `55` · `48 89 E5` · `48 81 EC 40 00 00 00`
+    /// (sub rsp, 0x40) — then the rdi/rsi/rdx ABI spills.
+    #[rustfmt::skip]
+    const GOLDEN_TABLE_MODULE: [u8; 212] = [
+        0xF3, 0x0F, 0x1E, 0xFA, 0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC, 0x40,
+        0x00, 0x00, 0x00, 0x48, 0x89, 0xBD, 0xD0, 0xFF, 0xFF, 0xFF, 0x48, 0x89,
+        0xB5, 0xC8, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0x95, 0xC0, 0xFF, 0xFF, 0xFF,
+        0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89,
+        0x85, 0xF8, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0xF0, 0xFF, 0xFF, 0xFF,
+        0x48, 0x89, 0x85, 0xE8, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0x85, 0xE0, 0xFF,
+        0xFF, 0xFF, 0x48, 0x89, 0x85, 0xD8, 0xFF, 0xFF, 0xFF, 0x48, 0xB8, 0x05,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0x85, 0xF8, 0xFF,
+        0xFF, 0xFF, 0x48, 0xB8, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x48, 0x89, 0x85, 0xF0, 0xFF, 0xFF, 0xFF, 0x48, 0x8B, 0x85, 0xF8, 0xFF,
+        0xFF, 0xFF, 0x50, 0x48, 0x8B, 0x85, 0xF0, 0xFF, 0xFF, 0xFF, 0x48, 0x89,
+        0xC1, 0x58, 0x48, 0x01, 0xC8, 0x48, 0x89, 0x85, 0xE8, 0xFF, 0xFF, 0xFF,
+        0x48, 0x8B, 0x85, 0xE8, 0xFF, 0xFF, 0xFF, 0x50, 0x48, 0x8B, 0x85, 0xF8,
+        0xFF, 0xFF, 0xFF, 0x48, 0x89, 0xC1, 0x58, 0x48, 0x0F, 0xAF, 0xC1, 0x48,
+        0x89, 0x85, 0xE0, 0xFF, 0xFF, 0xFF, 0x48, 0x8B, 0x85, 0xE0, 0xFF, 0xFF,
+        0xFF, 0x50, 0x48, 0x8B, 0x85, 0xF0, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0xC1,
+        0x58, 0x48, 0x29, 0xC8, 0x48, 0x89, 0x85, 0xD8, 0xFF, 0xFF, 0xFF, 0x48,
+        0x8B, 0x85, 0xD8, 0xFF, 0xFF, 0xFF, 0xC9, 0xC3,
+    ];
+
+    /// R5a golden gate — the `CallMode::Table` module-function product is byte-stable (see
+    /// [`GOLDEN_TABLE_MODULE`]'s doc for why Table mode is the address-free one).
+    #[test]
+    fn golden_table_module_func_bytes_stable() {
+        let isa = sample::isa();
+        let code = emit_module_func(&isa, &table_golden_func(), 0, 0, CallMode::Table);
+        assert_eq!(
+            code.as_slice(),
+            &GOLDEN_TABLE_MODULE[..],
+            "Table-mode module-fn emission drifted (H2 endbr64 + no-probe invariant); \
+             re-capture deliberately"
+        );
+    }
+
+    /// H2 killer gate — every emitted function (both entry points, both `CallMode`s) begins with
+    /// `endbr64`.
+    #[test]
+    fn endbr64_at_head_of_every_emitted_function() {
+        let isa = sample::isa();
+        // single-function path, a corpus of shapes
+        let singles = [
+            (golden_program(), 6usize, 0usize),
+            (sample::sum_to_program(), 5, 1),
+            (sample::factorial_program(6), 4, 0),
+        ];
+        for (prog, nlocals, nargs) in &singles {
+            let code = emit_fn(&isa, prog, *nlocals, *nargs);
+            assert_eq!(&code[0..4], &ENDBR64, "single-fn head must be endbr64");
+        }
+        // module-function path, both call modes, a corpus of frame sizes
+        for f in [module_func(3), module_func(64), module_func(600)] {
+            for mode in [CallMode::Table, CallMode::Dispatch(0x1000, 0x2000)] {
+                let code = emit_module_func(&isa, &f, 0, 0, mode);
+                assert_eq!(&code[0..4], &ENDBR64, "module-fn head must be endbr64");
+            }
+        }
+    }
+
+    /// H1b structural gate + boundary pairs (design §H1b: 4096/4112, nlocals 512/513 single-fn,
+    /// nlocals 509/510 module-fn) + unroll/loop coverage.
+    #[test]
+    fn prologue_probe_structure_and_boundaries() {
+        let isa = sample::isa();
+        let frame_of = |slots: usize| ((slots * 8).div_ceil(16) * 16) as u32;
+
+        // single-function boundary: 512 locals -> frame 4096 (no probe); 513 -> 4112 (probe, npages 1)
+        for (nlocals, want_frame) in [(512usize, 4096u32), (513, 4112)] {
+            let prog = vec![Inst::new(HALT, 0, 0, 0)];
+            let code = emit_fn(&isa, &prog, nlocals, 0);
+            let pro = parse_prologue(&code);
+            assert_eq!(want_frame, frame_of(nlocals));
+            assert_probe_invariants(&pro, want_frame);
+        }
+        // module-function boundary: 509 locals (+3 slots) -> 4096 (no probe); 510 -> 4112 (probe)
+        for (nlocals, want_frame) in [(509usize, 4096u32), (510, 4112)] {
+            let code = emit_module_func(&isa, &module_func(nlocals), 0, 0, CallMode::Table);
+            let pro = parse_prologue(&code);
+            assert_eq!(want_frame, frame_of(nlocals + 3));
+            assert_probe_invariants(&pro, want_frame);
+        }
+        // unroll coverage (npages 1..=4) and loop coverage (npages > 4) via single-fn frames
+        for nlocals in [513usize, 1024, 1536, 2048, 2560, 3000, 5000] {
+            let prog = vec![Inst::new(HALT, 0, 0, 0)];
+            let code = emit_fn(&isa, &prog, nlocals, 0);
+            let pro = parse_prologue(&code);
+            assert_probe_invariants(&pro, frame_of(nlocals));
+        }
+    }
+
+    /// H1b large-frame execution gate + live-locals variant — a probed frame (unroll AND loop form)
+    /// must still execute bit-identically to the interpreter oracle, proving the probe is transparent
+    /// to results and does not corrupt the frame.
+    #[test]
+    fn large_frame_executes_correctly() {
+        let isa = sample::isa();
+        // unroll form (nlocals 513 -> frame 4112, npages 1) and loop form (nlocals 3000 -> frame
+        // 24000, npages 5) — deepest local is written and read back (live-locals variant).
+        for nlocals in [513usize, 3000] {
+            let deep = (nlocals - 1) as i32;
+            let prog = vec![
+                Inst::new(MOV_IMM, 0, 1, 0),    // r0 = 1
+                Inst::new(MOV_IMM, deep, 7, 0), // r[deep] = 7 (touch the deepest slot)
+                Inst::new(ADD, 0, 0, deep),     // r0 = r0 + r[deep] = 8
+                Inst::new(HALT, 0, 0, 0),       // return r0
+            ];
+            let got = compile(&isa, &prog, nlocals, 0).call(&[]);
+            let want = interpret(&isa, &prog, nlocals);
+            assert_eq!(got, want, "large-frame exec (nlocals={nlocals})");
+            assert_eq!(got, 8);
+        }
+        // live-locals variant: write EVERY local to a distinct value, then sum three deep ones —
+        // exercises the whole large frame, so a probe that corrupted deep slots would surface.
+        let nlocals = 700usize; // frame = 5600, npages 1 (unroll)
+        let mut prog = Vec::new();
+        for i in 0..nlocals {
+            prog.push(Inst::new(MOV_IMM, i as i32, (i % 100) as i32, 0));
+        }
+        prog.push(Inst::new(ADD, 0, 697, 698)); // r0 = r697 + r698
+        prog.push(Inst::new(ADD, 0, 0, 699)); // r0 += r699
+        prog.push(Inst::new(HALT, 0, 0, 0));
+        let got = compile(&isa, &prog, nlocals, 0).call(&[]);
+        let want = interpret(&isa, &prog, nlocals);
+        assert_eq!(got, want, "live-locals large-frame exec");
+    }
 
     #[test]
     fn baseline_matches_interp_samples() {

@@ -603,6 +603,56 @@ impl Inst {
     }
 }
 
+/// H5: the **explicit "never promote" threshold sentinel** — `u32::MAX` as a tier/OSR threshold means
+/// "this tier is opted OUT, unconditionally", not "a very large real threshold". This is a SUPPORTED
+/// contract, not a convention: every threshold judgment in `otter` (the single-function
+/// [`engine::Engine`] and its OSR trigger) and in `otter-engine` (which re-exports this constant) goes
+/// through [`due`], which short-circuits on `NEVER` *before* comparing — so a saturated call counter
+/// (all counters saturate at `u32::MAX`; see [`engine::Engine::call`]) can never "reach" a `NEVER`
+/// threshold. T0-pinning an engine (`t1 == t2 == NEVER`, or `otter-engine`'s
+/// `ModuleEngine::interpreter_only`) is therefore stable for any call count.
+///
+/// Contrast with `otter-engine`'s `ModuleEngine::depth_limit`, where `u32::MAX` is a REAL (in-practice
+/// unreachable) limit, not an opt-out sentinel — the two `u32::MAX`s mean different things; each doc
+/// cross-references the other.
+pub const NEVER: u32 = u32::MAX;
+
+/// H5: THE tier-up/OSR threshold predicate — "has counter `c` made threshold `threshold` due?".
+/// Single source (no-dual-source rule): every promotion judgment — `otter-engine`'s three
+/// `maybe_tier_up` sites, [`engine::Engine::call`]'s tier scan, and the OSR back-edge trigger in
+/// [`interp::interpret_until_osr`] — calls THIS function rather than re-writing `c >= threshold`
+/// inline, so the [`NEVER`] opt-out can never be dropped from one copy of the predicate. `NEVER` is
+/// checked FIRST: a threshold of `u32::MAX` never fires, even for a saturated (`u32::MAX`) counter.
+#[inline]
+pub fn due(c: u32, threshold: u32) -> bool {
+    threshold != NEVER && c >= threshold
+}
+
+#[cfg(test)]
+mod due_tests {
+    use super::{NEVER, due};
+
+    /// H5: boundary-exhaustive pin of the REAL function (not a local re-derivation) — the mutation
+    /// target is "someone simplifies `due` back to `c >= threshold`", which `(MAX, MAX) → false`
+    /// alone kills (a saturated counter meets a `u32::MAX` threshold under plain `>=`).
+    #[test]
+    fn due_boundaries() {
+        assert!(
+            !due(u32::MAX, NEVER),
+            "saturated counter must NOT fire a NEVER threshold"
+        );
+        assert!(
+            due(u32::MAX, u32::MAX - 1),
+            "MAX-1 is a real threshold; a saturated counter fires it"
+        );
+        assert!(due(0, 0), "threshold 0 fires on the first (0-count) judgment");
+        assert!(
+            !due(u32::MAX - 1, NEVER),
+            "NEVER is not a real threshold for any counter value"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Tier 0: the generic interpreter — the semantic reference oracle (correctness-first, PyPy style).
 // ---------------------------------------------------------------------------------------------------
@@ -712,6 +762,10 @@ pub mod interp {
     /// when one reaches `osr_threshold`, returns [`Step::Osr`] with `locals` holding the live frame at
     /// that loop header. This is the **OSR trigger**: a long-running loop that was only *called* once
     /// (so call-count tiering never fires) can still be promoted mid-flight.
+    ///
+    /// H5: back-edge counters saturate (never wrap back below the threshold), and the trigger is the
+    /// shared [`crate::due`] predicate — `osr_threshold == `[`crate::NEVER`] means "never OSR", even
+    /// for a loop hot enough to saturate its counter (the caller then runs to completion at T0).
     pub fn interpret_until_osr(
         isa: &Isa,
         prog: &[Inst],
@@ -752,8 +806,10 @@ pub mod interp {
                 }
             }
             if next <= pc {
-                backedge[next] += 1;
-                if backedge[next] >= osr_threshold {
+                // H5: saturate + judge via the shared `due` predicate (never a bare `>=`), so a
+                // `NEVER` threshold cannot fire even once the counter saturates at u32::MAX.
+                backedge[next] = backedge[next].saturating_add(1);
+                if crate::due(backedge[next], osr_threshold) {
                     return Step::Osr(next);
                 }
             }
@@ -2403,7 +2459,7 @@ pub mod engine {
     //! no matter which tier served it — tiering is an optimization, never a semantic change.
 
     use super::interp::{Step, interpret_from, interpret_until_osr, interpret_with};
-    use super::{Inst, Isa, Value};
+    use super::{Inst, Isa, Value, due};
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -2504,6 +2560,10 @@ pub mod engine {
 
         /// Add a tier: its backend and the call count at which functions promote to it. Tiers must be
         /// added in strictly ascending threshold order (asserted).
+        ///
+        /// H5: because [`crate::NEVER`] (`u32::MAX`) still participates in this strict-ascending
+        /// assert, a `NEVER` tier can effectively only be registered as the FINAL tier (an opt-out
+        /// cap) — any `add_tier` after it fails the assert immediately (no threshold exceeds it).
         pub fn add_tier(&mut self, backend: Box<dyn Backend>, threshold: u32) -> &mut Self {
             if let Some(last) = self.tiers.last() {
                 assert!(
@@ -2549,15 +2609,20 @@ pub mod engine {
 
         /// Call function `f` with `args`. Promotes through tiers transparently; the result is identical
         /// regardless of which tier served it.
+        ///
+        /// H5 (Engine symmetry with `otter-engine`'s `ModuleEngine`): the call counter SATURATES at
+        /// `u32::MAX` (never wraps), and every threshold judgment goes through the shared
+        /// [`crate::due`] predicate — so a tier registered with threshold [`crate::NEVER`] is a
+        /// supported "never promote to this tier" opt-out, stable for any call count.
         pub fn call(&mut self, f: FuncId, args: &[Value]) -> Value {
             let i = f.0;
-            self.funcs[i].calls += 1;
+            self.funcs[i].calls = self.funcs[i].calls.saturating_add(1);
             let calls = self.funcs[i].calls;
 
-            // highest tier whose threshold is satisfied (tiers are ascending)
+            // highest tier whose threshold is due (tiers are ascending; `due` filters NEVER — H5)
             let mut target = 0usize;
             for (k, t) in self.tiers.iter().enumerate() {
-                if calls >= t.threshold {
+                if due(calls, t.threshold) {
                     target = k + 1;
                 }
             }

@@ -131,10 +131,26 @@ fn call_host_ctx2(
     b.inst_results(call)[0]
 }
 
-fn new_module() -> JITModule {
-    let builder =
-        JITBuilder::new(cranelift_module::default_libcall_names()).expect("host ISA should be supported");
+/// H1c — the probestack flag **atomic pair** baked into every JIT ISA this crate builds
+/// (design §H1c). Both keys are mandatory together: `probestack_strategy` defaults to `outline`,
+/// which lowers a probe to a `call __cranelift_probestack` libcall symbol this JIT never defines,
+/// so `enable_probestack=true` alone would fail `finalize_definitions` with an unresolved symbol.
+/// `inline` (present on x64 as `gen_inline_probestack`, `PROBE_MAX_UNROLL=4`, sub-then-touch) emits
+/// the probe in-line, no symbol. `probestack_size_log2` keeps its default (12 ⇒ 4096-byte pages).
+/// Small frames (`< 4096`) are byte-unchanged (probe_count rounds down to 0); large frames gain the
+/// guard-page walk. This single construction point covers every compile path (`compile_fn`,
+/// `compile_module`, `compile_dispatch_fn`, `compile_resumable`).
+const PROBESTACK_FLAGS: [(&str, &str); 2] =
+    [("enable_probestack", "true"), ("probestack_strategy", "inline")];
+
+fn new_module_with_flags(flags: &[(&str, &str)]) -> JITModule {
+    let builder = JITBuilder::with_flags(flags, cranelift_module::default_libcall_names())
+        .expect("host ISA should be supported");
     JITModule::new(builder)
+}
+
+fn new_module() -> JITModule {
+    new_module_with_flags(&PROBESTACK_FLAGS)
 }
 
 /// Does this opcode's semantics transfer control (end a basic block)? Derived from the IR + hint.
@@ -1698,5 +1714,238 @@ mod tests {
         let f = eng.register(sample::sum_to_guarded_program(5000), 6, 1);
         let n = 100_000i64;
         assert_eq!(eng.call(f, &[n]), n * (n + 1) / 2);
+    }
+
+    // =============================================================================================
+    // H1c (ship-hardening) — T2 Cranelift inline probestack (design §H1c).
+    //
+    // MUTATION LEDGER (design §H1c "게이트"). Each row is a way to weaken the probestack config;
+    // the named assertion is where it goes RED.
+    //
+    //   Mutation                                     | Killed by
+    //   ---------------------------------------------|----------------------------------------------
+    //   `probestack_strategy` dropped (enable only)  | probestack_flags_diff_is_exactly_two_keys
+    //                                                |   (only 1 key differs) + finalize would fail
+    //                                                |   with unresolved __cranelift_probestack
+    //   `enable_probestack` dropped (strategy only)  | probestack_flags_diff_is_exactly_two_keys
+    //                                                |   (only 1 key differs)
+    //                                                | inline_probestack_present_on_large_frame
+    //                                                |   (large-frame length diff drops to 0)
+    //   Whole pair dropped (PROBESTACK_FLAGS = [])   | both tests above (0 keys / 0 length diff)
+    //   `strategy` set to "outline"                  | inline_probestack_present_on_large_frame
+    //                                                |   panics: unresolved libcall at finalize
+    //
+    // (The T1 endbr64/probe mutations live in the otter-baseline ledger.)
+    // =============================================================================================
+
+    use cranelift_codegen::settings::{self, Configurable};
+
+    /// Minimal ISA with a `Call` op — enough to drive the argbuf stack slot that triggers the T2
+    /// probe. Op order: mov_imm(0), add(1), call(2), halt(3), ret(4).
+    fn call_isa() -> Isa {
+        use otter::{ArithOp, BinOp, NumTy, OpDef, OpHints};
+        let pure = OpHints {
+            pure: true,
+            terminator: false,
+        };
+        Isa {
+            ops: vec![
+                OpDef {
+                    name: "mov_imm",
+                    effects: vec![Effect::SetLocalAt {
+                        reg: 0,
+                        value: Expr::OperandImm(1),
+                    }],
+                    hints: pure,
+                },
+                OpDef {
+                    name: "add",
+                    effects: vec![Effect::SetLocalAt {
+                        reg: 0,
+                        value: Expr::Bin(
+                            BinOp::new(NumTy::I64, ArithOp::Add),
+                            Box::new(Expr::LocalAt(1)),
+                            Box::new(Expr::LocalAt(2)),
+                        ),
+                    }],
+                    hints: pure,
+                },
+                OpDef {
+                    name: "call",
+                    effects: vec![Effect::Call {
+                        dest: 0,
+                        base: 1,
+                        argc: 2,
+                    }],
+                    hints: OpHints {
+                        pure: false,
+                        terminator: false,
+                    },
+                },
+                OpDef {
+                    name: "halt",
+                    effects: vec![Effect::Halt {
+                        value: Expr::LocalAt(0),
+                    }],
+                    hints: OpHints {
+                        pure: false,
+                        terminator: true,
+                    },
+                },
+                OpDef {
+                    name: "ret",
+                    effects: vec![Effect::Return {
+                        value: Expr::LocalAt(0),
+                    }],
+                    hints: OpHints {
+                        pure: false,
+                        terminator: true,
+                    },
+                },
+            ],
+        }
+    }
+
+    /// A module whose entry function makes a `Call` with `argc` args. The per-call argument buffer is
+    /// a `argc*8`-byte explicit stack slot (see `lower_module_func`), so `argc >= 520` (=> 4160 B) is
+    /// the deterministic T2 large-frame trigger (design §H1c: T2 frames are regalloc products, not
+    /// nlocals-proportional — the explicit argbuf is the reliable knob).
+    fn call_module(argc: usize) -> OtterModule {
+        const CALL: u16 = 2;
+        const HALT: u16 = 3;
+        let entry = FuncDef {
+            nparams: 0,
+            consts: vec![1], // local[0] = 1 (callee index)
+            nlocals: argc + 5,
+            code: vec![
+                Inst::new(CALL, 0, 0, argc as i32), // dest=l0, base=l0(callee=1), argc
+                Inst::new(HALT, 0, 0, 0),
+            ],
+        };
+        let callee = FuncDef {
+            nparams: 0,
+            consts: vec![],
+            nlocals: 1,
+            code: vec![Inst::new(HALT, 0, 0, 0)],
+        };
+        OtterModule {
+            funcs: vec![entry, callee],
+            fill: 0,
+            host_ctx: 0,
+            entry: 0,
+        }
+    }
+
+    /// Total machine-code bytes for `m` compiled under `flags` (mirrors `compile_module`'s per-fn
+    /// loop but reads each function's `code_buffer().len()` — the probe-existence measuring channel).
+    fn compiled_code_len(isa: &Isa, m: &OtterModule, flags: &[(&str, &str)]) -> usize {
+        let mut module = new_module_with_flags(flags);
+        let ptr_ty = module.target_config().pointer_type();
+        let conv = module.target_config().default_call_conv;
+        let mut abi = Signature::new(conv);
+        abi.params.push(AbiParam::new(ptr_ty));
+        abi.params.push(AbiParam::new(ptr_ty));
+        abi.params.push(AbiParam::new(types::I64));
+        abi.returns.push(AbiParam::new(types::I64));
+        let ids: Vec<_> = (0..m.funcs.len())
+            .map(|i| {
+                module
+                    .declare_function(&alloc_name(i), Linkage::Local, &abi)
+                    .expect("declare")
+            })
+            .collect();
+        let mut fbctx = FunctionBuilderContext::new();
+        let mut total = 0usize;
+        for (i, f) in m.funcs.iter().enumerate() {
+            let mut ctx = module.make_context();
+            ctx.func.signature = abi.clone();
+            lower_module_func(
+                &mut ctx.func,
+                &mut fbctx,
+                isa,
+                m.fill,
+                m.host_ctx,
+                f,
+                ptr_ty,
+                conv,
+                CallMode::Table,
+            );
+            module.define_function(ids[i], &mut ctx).expect("define");
+            total += ctx
+                .compiled_code()
+                .expect("compiled code present")
+                .code_buffer()
+                .len();
+            module.clear_context(&mut ctx);
+        }
+        module.finalize_definitions().expect("finalize");
+        total
+    }
+
+    fn flags_dump(extra: &[(&str, &str)]) -> String {
+        let mut b = settings::builder();
+        for (k, v) in extra {
+            b.set(k, v).expect("known flag");
+        }
+        settings::Flags::new(b).to_string()
+    }
+
+    /// H1c gate (i) — mechanized proof of non-contact: enabling `PROBESTACK_FLAGS` changes the ISA
+    /// `Flags` in EXACTLY the two intended keys and nothing else.
+    #[test]
+    fn probestack_flags_diff_is_exactly_two_keys() {
+        let base: Vec<String> = flags_dump(&[]).lines().map(str::to_string).collect();
+        let probe: Vec<String> = flags_dump(&PROBESTACK_FLAGS)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(base.len(), probe.len(), "flag dumps must have the same line set");
+        let mut diff_keys: Vec<String> = base
+            .iter()
+            .zip(probe.iter())
+            .filter(|(a, c)| a != c)
+            .map(|(a, _)| a.split('=').next().unwrap().trim().to_string())
+            .collect();
+        diff_keys.sort();
+        assert_eq!(
+            diff_keys,
+            vec!["enable_probestack".to_string(), "probestack_strategy".to_string()],
+            "exactly the probestack atomic pair may differ"
+        );
+    }
+
+    /// H1c gate (ii) — probe existence: on a large-frame module (`argc >= 520`) enabling the flags
+    /// grows the code (the inline guard-page walk); on a small-frame module the code is byte-for-byte
+    /// unchanged (probe_count rounds down to 0).
+    #[test]
+    fn inline_probestack_present_on_large_frame() {
+        let isa = call_isa();
+        let large = call_module(520); // argbuf 4160 B > 4096 -> probe
+        let small = call_module(2); // argbuf 16 B -> no probe
+
+        let large_off = compiled_code_len(&isa, &large, &[]);
+        let large_on = compiled_code_len(&isa, &large, &PROBESTACK_FLAGS);
+        assert!(
+            large_on > large_off,
+            "inline probestack must add bytes on a large frame (off={large_off}, on={large_on})"
+        );
+
+        let small_off = compiled_code_len(&isa, &small, &[]);
+        let small_on = compiled_code_len(&isa, &small, &PROBESTACK_FLAGS);
+        assert_eq!(
+            small_on, small_off,
+            "small-frame code must be unchanged by the probestack flags"
+        );
+    }
+
+    /// H1c sanity — a large-frame (probed) module still executes bit-identically to the interpreter
+    /// oracle: the inline probe is transparent to results.
+    #[test]
+    fn large_frame_probed_module_runs_like_oracle() {
+        let isa = call_isa();
+        let m = call_module(520);
+        let got = compile_module(&isa, &m).run(&[]);
+        let want = otter::interp::run_module(&isa, &m, &[]);
+        assert_eq!(got, want, "probed large-frame module diverged from the oracle");
     }
 }

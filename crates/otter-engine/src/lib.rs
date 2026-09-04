@@ -124,7 +124,11 @@ use core::ptr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use otter::interp::TailReq;
-use otter::{FuncDef, Isa, Module, Value};
+use otter::{FuncDef, Isa, Module, Value, due};
+// H5: the "never promote" threshold sentinel is DEFINED in otter (L0) — the only placement both this
+// crate's `ModuleEngine::new` callers and `otter::engine::Engine` users can name without a dependency
+// inversion — and re-exported here so `ModuleEngine` embedders need only this crate.
+pub use otter::NEVER;
 
 // O-12: this crate's ENTIRE fail-closed story (module doc above, "Hard invariant this file relies on")
 // depends on `panic = "unwind"` — `catch_unwind` in `module_dispatch`/`tail_signal`/`try_dispatch` cannot
@@ -274,6 +278,65 @@ mod otter_jit {
     }
 }
 
+/// H1a: default native-stack byte budget (1 MiB) for one `ModuleEngine` call tree — see
+/// [`ModuleEngine::set_stack_budget`] for the full contract (what is measured, from where, and how to
+/// calibrate it against the embedding thread's REAL stack).
+pub const DEFAULT_STACK_BUDGET: usize = 1 << 20;
+
+/// H1a: default recursion-depth backstop (4096 live `dispatch()` activations). Deliberately LARGE —
+/// the byte budget is the primary guard, and this default must not fire before it on small frames
+/// (panel-measured round-trips: T0 ≈ 1,328 B — `nlocals`-independent, locals live in a heap `Vec` —
+/// T1 ≈ 1,120 B + 8×(nlocals+3+maxargc), T2 ≈ 1,136 B; the 1 MiB default budget is ≈ 800+ levels of
+/// small frames, well under 4096). Its job is the runaway-recursion class the budget could miss only
+/// if misconfigured. See [`ModuleEngine::set_depth_limit`].
+pub const DEFAULT_DEPTH_LIMIT: u32 = 4096;
+
+/// H1a: WHY this engine is [`trapped`](ModuleEngine::trapped) — the discriminator between the
+/// pre-existing caught-panic poisoning and the two stack-guard limits (which poison WITHOUT any
+/// panic/unwind: flag set + `fill` returned, state integrity intact). Read via
+/// [`ModuleEngine::trap_reason`]; meaningful only while `trapped()` is `true`. The [`Trap`] struct
+/// itself is unchanged (reason is engine-side state, exactly like `trapped_idx`).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrapReason {
+    /// A Rust panic was caught at one of the three panic-catching boundaries ([`module_dispatch`],
+    /// [`tail_signal`], [`ModuleEngine::try_dispatch`]) — the pre-H1a meaning of `trapped`, and the
+    /// idle default while not trapped.
+    Panic,
+    /// The H1a depth backstop fired: a `dispatch()` entry would have exceeded
+    /// [`ModuleEngine::depth_limit`] live activations. Recoverable (O-10): raise the limit (or
+    /// retry from a shallower tree) + [`ModuleEngine::clear_trap`].
+    DepthLimit,
+    /// The H1a byte budget fired: native stack consumed since the outermost `dispatch()` entry
+    /// exceeded [`ModuleEngine::stack_budget`]. Recoverable (O-10), same as [`Self::DepthLimit`].
+    StackBudget,
+}
+
+/// H1a pin (i): RAII token for one live `dispatch()` activation — this `Drop` is the ONLY place
+/// `depth` is ever decremented. `clear_trap` deliberately never touches `depth`/`stack_base`: it may
+/// be called from the MIDDLE of a live call tree (O-10 recoverability), where the outer activations'
+/// count must survive; and a panic unwinding through `dispatch` releases its count through this same
+/// `Drop` (ordinary RAII), so a caught trap can never leak depth. `stack_base` needs no reset on the
+/// way out: it is re-recorded at the next 0→1 depth transition before anything reads it.
+struct FrameGuard<'a> {
+    eng: &'a ModuleEngine,
+}
+
+impl Drop for FrameGuard<'_> {
+    fn drop(&mut self) {
+        let d = self.eng.depth.get();
+        // Invariant documentation, not control flow: a FrameGuard exists only after `enter_frame`
+        // incremented `depth`, so 0 here means a second decrementer crept in. Beyond this
+        // debug_assert the body must stay panic-free (pin (i)): this Drop runs during trap unwinds,
+        // where a fresh panic would be a double-panic abort.
+        debug_assert!(
+            d > 0,
+            "FrameGuard::drop with depth == 0 — depth has a second decrementer"
+        );
+        self.eng.depth.set(d.saturating_sub(1));
+    }
+}
+
 /// The adaptive engine for one `otter` function [`Module`] (one per JS agent, like the heap).
 pub struct ModuleEngine {
     isa: Isa,
@@ -299,14 +362,40 @@ pub struct ModuleEngine {
     t2_threshold: u32,
     /// Set if a panic was caught crossing the FFI boundary (malformed bytecode) — the engine is then
     /// poisoned and every further dispatch returns `fill`, so a trap can never abort the process.
+    ///
+    /// H1a: ALSO set — without any panic or unwind — when a stack guard fires ([`TrapReason`]
+    /// distinguishes the causes): limit reached ⇒ flag set + `fill` returned normally through the
+    /// whole in-flight tree, state integrity intact. Because this is flag-based, the guards protect
+    /// the non-`try_*` [`ModuleEngine::run`]/`dispatch` paths from a stack-overflow abort too (a
+    /// partial mitigation of the O-12 known gap for exactly this failure class — a panic elsewhere on
+    /// those paths still unwinds to the caller as documented there).
     trapped: Cell<bool>,
     /// O-10: the function index in flight at whichever panic-catching boundary ([`module_dispatch`],
-    /// [`tail_signal`], or [`ModuleEngine::try_dispatch`]'s own boundary) most recently caught a panic —
-    /// always `Some` whenever `trapped` is `true` (all three call sites set this together, in the same
-    /// breath as `trapped.set(true)`), and reset to `None` by [`ModuleEngine::clear_trap`] for hygiene
-    /// (never read while [`Self::trapped`] is `false`). See [`Trap::idx`]'s doc for what this value means
-    /// (a diagnostic hint — the nearest available site, not a full backtrace).
+    /// [`tail_signal`], or [`ModuleEngine::try_dispatch`]'s own boundary) most recently caught a panic
+    /// — or, since H1a, the callee whose `dispatch()` entry tripped a stack guard. Always `Some`
+    /// whenever `trapped` is `true` (every recording site goes through [`ModuleEngine::record_trap`],
+    /// which sets the three trap cells together), and reset to `None` by [`ModuleEngine::clear_trap`]
+    /// for hygiene (never read while [`Self::trapped`] is `false`). See [`Trap::idx`]'s doc for what
+    /// this value means (a diagnostic hint — the nearest available site, not a full backtrace).
     trapped_idx: Cell<Option<usize>>,
+    /// H1a: why `trapped` is set — see [`TrapReason`]. Recorded together with the two cells above by
+    /// [`ModuleEngine::record_trap`]; reset to the idle default `Panic` by `clear_trap` (hygiene,
+    /// like `trapped_idx` — never read while `trapped` is `false`).
+    trap_reason: Cell<TrapReason>,
+    /// H1a: number of LIVE `dispatch()` activations (counted once per function entry — the tail
+    /// trampoline loop's iterations are deliberately NOT counted, pin (iii)). Incremented only by
+    /// `enter_frame`, decremented only by [`FrameGuard`]'s `Drop` (pin (i)).
+    depth: Cell<u32>,
+    /// H1a: the SP proxy (address of a `dispatch` stack local) recorded at the outermost (0→1 depth)
+    /// entry — the baseline the byte budget is measured from. Stale once depth returns to 0;
+    /// re-recorded before any read at the next outermost entry.
+    stack_base: Cell<usize>,
+    /// H1a primary guard: max native-stack bytes a call tree may consume below `stack_base`
+    /// ([`DEFAULT_STACK_BUDGET`]; see [`ModuleEngine::set_stack_budget`]).
+    stack_budget: Cell<usize>,
+    /// H1a backstop guard: max live `dispatch()` activations ([`DEFAULT_DEPTH_LIMIT`]; see
+    /// [`ModuleEngine::set_depth_limit`]).
+    depth_limit: Cell<u32>,
     /// O-8c compiled-tier tail-call trampoline signal (shared by BOTH compiled tiers — T2 Cranelift,
     /// T1 baseline): the baked [`tail_signal`] helper sets these three, then the compiled function
     /// returns immediately (pure machine epilogue, no Rust in between, on either backend) so
@@ -380,7 +469,18 @@ pub struct ModuleEngine {
 
 impl ModuleEngine {
     /// Build an engine. `t1`/`t2` are the call counts at which a function is promoted to the baseline /
-    /// Cranelift tiers (`t1 <= t2`; `0` would compile on the first call).
+    /// Cranelift tiers: `0` compiles on the first call, [`NEVER`] (`u32::MAX`) means "this tier is
+    /// opted out, unconditionally" (H5 — a SUPPORTED contract, not a large threshold: counters
+    /// saturate and every judgment goes through [`otter::due`], so a `NEVER` tier can never fire),
+    /// and anything else is a real threshold. Requires `t1 <= t2 || t1 == NEVER`.
+    ///
+    /// The three threshold modes (H5, each pinned by a test):
+    ///
+    /// | `t1`     | `t2`     | resulting ladder                                                     |
+    /// |----------|----------|----------------------------------------------------------------------|
+    /// | `NEVER`  | `NEVER`  | T0-pinned forever ([`Self::interpreter_only`])                       |
+    /// | real     | `NEVER`  | T1 cap: settles at baseline, NEVER promotes to cranelift             |
+    /// | `NEVER`  | real     | T2 direct: interpreter → cranelift, baseline never compiled (no T1 RX pages emitted at all — a B2 attack-surface reduction, security-relevant) |
     ///
     /// `module`'s code is not validated against `isa` here — malformed bytecode is only ever caught
     /// lazily, the first time the offending function is actually dispatched, via the trap mechanism
@@ -390,7 +490,13 @@ impl ModuleEngine {
     /// doc's "Known gaps" section (O-12) for why lazy trapping alone is not equivalent to pre-validation
     /// (in particular, it does not close `otter-baseline`'s panic-less local-index memory corruption).
     pub fn new(isa: Isa, module: Module, t1: u32, t2: u32) -> Self {
-        assert!(t1 <= t2, "t1 threshold must be <= t2");
+        // H5 relaxation (panel ③-2): `t1 == NEVER, t2 == real` is the legitimate T2-direct mode (see
+        // the table above), so the ordering assert exempts exactly that case — any other t1 > t2
+        // remains the configuration bug it always was.
+        assert!(
+            t1 <= t2 || t1 == NEVER,
+            "t1 threshold must be <= t2 (or t1 == NEVER for T2-direct)"
+        );
         let n = module.funcs.len();
         let counts = (0..n).map(|_| Cell::new(0)).collect();
         // O-8c-2: no per-function tier-eligibility pre-scan is needed anymore. O-8b/O-8c-1 restricted
@@ -412,6 +518,11 @@ impl ModuleEngine {
             t2_threshold: t2,
             trapped: Cell::new(false),
             trapped_idx: Cell::new(None),
+            trap_reason: Cell::new(TrapReason::Panic),
+            depth: Cell::new(0),
+            stack_base: Cell::new(0),
+            stack_budget: Cell::new(DEFAULT_STACK_BUDGET),
+            depth_limit: Cell::new(DEFAULT_DEPTH_LIMIT),
             tail_pending: Cell::new(false),
             tail_callee: Cell::new(0),
             tail_args: RefCell::new(Vec::new()),
@@ -426,9 +537,111 @@ impl ModuleEngine {
         }
     }
 
-    /// Whether a trap (caught FFI-boundary panic on malformed bytecode) has poisoned this engine.
+    /// H5: a T0-pinned engine — `new(isa, module, NEVER, NEVER)`. NO tier-up of any kind, ever
+    /// (supported contract: counters saturate, judgments go through [`otter::due`]), so no
+    /// executable page is ever mapped for this module — the intended replacement for the old
+    /// "thresholds far above any realistic call count" test/embedding idiom, which was never a
+    /// contract (a saturating counter eventually MEETS any real threshold).
+    pub fn interpreter_only(isa: Isa, module: Module) -> Self {
+        Self::new(isa, module, NEVER, NEVER)
+    }
+
+    /// Whether a trap has poisoned this engine — a caught FFI-boundary panic on malformed bytecode,
+    /// or (H1a) a stack-guard limit ([`TrapReason`] tells which; see [`Self::trap_reason`]).
     pub fn trapped(&self) -> bool {
         self.trapped.get()
+    }
+
+    /// H1a: WHY this engine is [`trapped`](Self::trapped) — see [`TrapReason`]. Meaningful only while
+    /// `trapped()` is `true` (idles at [`TrapReason::Panic`] otherwise, and is reset to it by
+    /// [`Self::clear_trap`]). Pin: once trapped, the reason (and `Trap::idx`) of the FIRST trap is
+    /// preserved — later would-be traps on the already-poisoned engine never overwrite it.
+    pub fn trap_reason(&self) -> TrapReason {
+        self.trap_reason.get()
+    }
+
+    /// H1a: the native-stack byte budget (primary stack guard) — see [`Self::set_stack_budget`].
+    pub fn stack_budget(&self) -> usize {
+        self.stack_budget.get()
+    }
+
+    /// H1a: set the native-stack byte budget (primary stack guard). Default
+    /// [`DEFAULT_STACK_BUDGET`] (1 MiB). `0` is forbidden (asserted) — "no budget" is not a mode;
+    /// pick a real number or (to lean on the depth backstop alone) `usize::MAX`.
+    ///
+    /// **What is measured, from where**: at every `dispatch()` entry the engine takes the address of
+    /// a stack local as an SP proxy; the budget bounds `outermost_entry_SP − current_SP`, i.e. bytes
+    /// consumed since the **outermost otter entry point** (the 0→1 depth transition). Whatever stack
+    /// the embedder consumed ABOVE that entry is the embedder's own accounting, not otter's. The
+    /// check is exact per entry (tier- and frame-size-independent, one subtraction + comparison), so
+    /// the real overshoot past the budget is at most one round-trip's frames.
+    ///
+    /// **Calibration — the embedding thread's REAL stack is the reference** (tsavorite lesson,
+    /// 2026-09-04): Rust spawned threads default to 2 MiB (`std::thread`, absent `RUST_MIN_STACK`),
+    /// a Linux main thread typically 8 MiB, **wasm32-wasip1 rustc defaults to 1 MiB total**
+    /// (adjust via `-C link-arg=-zstack-size=…`), and a musl-libc *foreign* pthread defaults to
+    /// 128 KiB. The default 1 MiB budget therefore fits a default Rust thread but NOT a default
+    /// wasip1 build (where the whole stack is 1 MiB — set a smaller budget or a larger
+    /// `-zstack-size`) and NOT a musl foreign thread (set a much smaller budget).
+    ///
+    /// **Fine print (what the SP proxy does and does not cover)**: (1) embedder frames in the
+    /// MIDDLE of the tree — e.g. a `HostCtx` callback's own Rust call stack — lie between the
+    /// outermost entry and the next `dispatch()` entry's SP probe, so they are included in
+    /// `base − sp` and charged against the budget. (2) A SINGLE oversized frame
+    /// (nlocals-proportional) can pass the entry check and then overshoot the remaining budget by
+    /// its own size in one step — the H1b/H1c large-frame probes guarantee that ends as a
+    /// fail-stop guard-page fault instead of silent corruption (a fail-stop guarantee, NOT an
+    /// abort-free one). (3) On wasm32 the SP proxy (address of a stack local) measures the LLVM
+    /// shadow stack only; the host-side wasm value stack (e.g. wasmtime's `max_wasm_stack`) is a
+    /// separate resource needing its own calibration.
+    ///
+    /// **Reserve compiler headroom out of the budget**: a tier-up compile runs at the DEEPEST point
+    /// reached so far (inside `maybe_tier_up`, before the budget's next check), so the real stack
+    /// must cover `budget + compiler peak`. Measured once (H1a, 2026-09-04, x86_64-linux,
+    /// Cranelift 0.132 `compile_dispatch_fn` on a large 4,096-inst/256-local function, bisecting
+    /// `Builder::stack_size` in subprocesses): the whole compile completes within **≈ 80 KiB** of
+    /// thread stack in release, **≈ 256 KiB** in a debug build (baseline T1 compiles are smaller
+    /// still). A `real_stack ≥ budget + 512 KiB` rule of thumb leaves generous margin on native;
+    /// tighten only with your own measurement.
+    ///
+    /// **Scope (H1a)**: the guards protect the `ModuleEngine` dispatch path only. (a)
+    /// `CallMode::Table` AOT artifacts never route through `dispatch()` — B10's "no untrusted
+    /// input" norm governs there; (b) direct `otter::interp::run_module`/`run_one` calls (the
+    /// oracle) use heap `Vec` frames — unbounded HEAP growth (OOM abort) remains, oracle-only
+    /// norm governs; (c) the single-function `otter::engine::Engine` has no recursive nesting
+    /// (Call/TailCall are unreachable there) — no guard needed. Every tier of THIS engine,
+    /// including H5 T0-pinned mode, is covered. Assumes the platform keeps ≥ 1 guard page below
+    /// the thread stack (a `guardsize(0)` embedder forfeits the abort-free claim between checks).
+    pub fn set_stack_budget(&self, bytes: usize) {
+        assert!(
+            bytes != 0,
+            "stack_budget of 0 is forbidden (see set_stack_budget's doc)"
+        );
+        self.stack_budget.set(bytes);
+    }
+
+    /// H1a: the recursion-depth backstop (secondary stack guard) — see [`Self::set_depth_limit`].
+    pub fn depth_limit(&self) -> u32 {
+        self.depth_limit.get()
+    }
+
+    /// H1a: set the recursion-depth backstop — the maximum LIVE `dispatch()` activations. Default
+    /// [`DEFAULT_DEPTH_LIMIT`] (4096, deliberately large: the byte budget is the primary guard and
+    /// must fire first on small frames — see that constant's doc for the measured frame sizes).
+    /// `0` is forbidden (asserted; the outermost call must always be able to enter). Proper tail
+    /// calls do NOT count against this limit (the trampoline loop re-enters callees without a new
+    /// `dispatch()` activation — pin (iii)); only genuine nesting does.
+    ///
+    /// `u32::MAX` here is a REAL limit that simply cannot be reached in practice — NOT an opt-out
+    /// sentinel. Contrast the tier thresholds' [`NEVER`] (`u32::MAX`), which IS an explicit
+    /// "opted out, never fires" sentinel (H5) — the two `u32::MAX`s deliberately mean different
+    /// things, on different axes (a guard you can only weaken vs a promotion you can switch off).
+    pub fn set_depth_limit(&self, limit: u32) {
+        assert!(
+            limit != 0,
+            "depth_limit of 0 is forbidden (see set_depth_limit's doc)"
+        );
+        self.depth_limit.set(limit);
     }
 
     /// Run the module's entry function with `args`. Equal to [`otter::interp::run_module`] for the same
@@ -482,6 +695,27 @@ impl ModuleEngine {
     /// as-is, no engine-field involvement needed there since `run_one` already returns to this same
     /// frame). Either way, `idx`/`cur` are updated and the loop re-enters WITHOUT a new Rust stack frame.
     fn dispatch(&self, mut idx: usize, args: &[Value]) -> Value {
+        // H1a pins (ii)+(iii): the stack guard runs ONCE per dispatch() ACTIVATION (function entry)
+        // — the tail trampoline loop below re-enters callees WITHOUT re-counting, or proper tail
+        // calls would stop being stack-bounded — and strictly AFTER the trapped → in_range checks
+        // (fixed order, pin (ii)): a poisoned engine or an OOB callee stays the pre-existing
+        // defined `fill` fallback, never a guard event. The loop head below re-checks
+        // trapped/in_range for every tail-signaled callee; the guard deliberately does not re-run
+        // there (its first-iteration re-check of this same condition is redundant but harmless).
+        if self.trapped.get() || !self.in_range(idx) {
+            return self.module.fill;
+        }
+        // SP proxy: the address of a local in THIS activation's frame — works on every tier and
+        // target (no asm, no OS query), costs one subtraction + comparison per entry.
+        let sp_probe = 0u8;
+        let _frame = match self.enter_frame(idx, core::ptr::from_ref(&sp_probe) as usize) {
+            Ok(g) => g,
+            // Limit reached: poison-flag semantics WITHOUT any unwind (H1a trap semantics) — the
+            // flag is already set (unless an earlier trap owns it, pin (ii)) and `fill` now returns
+            // normally through the whole in-flight tree, state integrity intact. Recoverable via
+            // clear_trap (O-10 contract) — NOT the wasm §2.4 discard-only class.
+            Err(()) => return self.module.fill,
+        };
         let mut owned: Vec<Value> = Vec::new();
         let mut cur: &[Value] = args;
         let mut tail = TailReq::default();
@@ -540,6 +774,53 @@ impl ModuleEngine {
             core::mem::swap(&mut owned, &mut tail.args);
             cur = &owned;
         }
+    }
+
+    /// H1a: THE one trap-recording site — sets `trapped`/`trapped_idx`/`trap_reason` together, and
+    /// ONLY when not already trapped (pin: the FIRST trap's reason/idx are preserved; the pre-H1a
+    /// FFI sites nominally overwrote, but were unreachable while trapped — `dispatch`'s loop head
+    /// short-circuits before any code that could panic — so making preservation explicit here is a
+    /// pin, not a behavior change). Callers: the two guard branches in [`Self::enter_frame`]
+    /// (each with its own [`TrapReason`]) and the three panic-catching boundaries (always
+    /// [`TrapReason::Panic`]).
+    fn record_trap(&self, idx: usize, reason: TrapReason) {
+        if self.trapped.get() {
+            return;
+        }
+        self.trapped.set(true);
+        self.trapped_idx.set(Some(idx));
+        self.trap_reason.set(reason);
+    }
+
+    /// H1a: count this `dispatch()` activation and enforce the two stack guards — called exactly
+    /// once per activation, from `dispatch`'s entry (pin (iii)), AFTER the trapped/in_range checks
+    /// (pin (ii)). `Ok` carries the RAII token whose `Drop` is the sole decrement (pin (i));
+    /// `Err(())` means a limit was hit: the trap is already recorded (against `idx`, with the
+    /// guard's own [`TrapReason`]) and the caller must return `fill` WITHOUT entering.
+    fn enter_frame(&self, idx: usize, sp: usize) -> Result<FrameGuard<'_>, ()> {
+        let d = self.depth.get();
+        if d == 0 {
+            // Outermost entry: record the budget baseline. No guard can fire here — the budget is
+            // measured FROM this very address, and `depth_limit >= 1` (its setter forbids 0) — so
+            // the outermost call always enters and the baseline is always fresh before any read.
+            self.stack_base.set(sp);
+        } else {
+            // Primary guard: byte budget. The stack grows downward, so bytes consumed since the
+            // outermost entry are `base - sp`; `wrapping_sub` makes a (impossible in practice)
+            // wrong-direction probe read as huge and trap, never wrap into a false pass.
+            if self.stack_base.get().wrapping_sub(sp) > self.stack_budget.get() {
+                self.record_trap(idx, TrapReason::StackBudget);
+                return Err(());
+            }
+            // Backstop: runaway-recursion depth (d live activations already; entering would make
+            // d + 1 > depth_limit).
+            if d >= self.depth_limit.get() {
+                self.record_trap(idx, TrapReason::DepthLimit);
+                return Err(());
+            }
+        }
+        self.depth.set(d + 1);
+        Ok(FrameGuard { eng: self })
     }
 
     /// The boundary between the "original" index space (`self.module.funcs`, which never grows — see the
@@ -691,10 +972,24 @@ impl ModuleEngine {
     fn install_wasm(&self, idx: usize, slot: WasmSlot) {
         let base = self.base();
         if idx < base {
+            // H3: add-only tripwire — overwriting a `Compiled` slot would drop its
+            // `CompiledWasmFn::scratch` Box while the dropped buffer's address stays BAKED into the
+            // registered wasm code: a dangling-scratch, the data-plane twin of T1's munmap-UAF.
+            // Only `Untried` may ever be written over (`maybe_tier_up` guarantees it; this assert
+            // makes a future second caller fail loudly in debug). Each borrow is a single
+            // expression, dropped at its statement's end — the existing borrow discipline.
+            debug_assert!(
+                matches!(&*self.wasm[idx].borrow(), WasmSlot::Untried),
+                "install_wasm over a non-Untried slot (add-only violation — dangling scratch)"
+            );
             *self.wasm[idx].borrow_mut() = slot;
             return;
         }
         if let Some(s) = self.pushed_wasm.borrow().get(idx - base) {
+            debug_assert!(
+                matches!(&*s.borrow(), WasmSlot::Untried),
+                "install_wasm over a non-Untried pushed slot (add-only violation — dangling scratch)"
+            );
             *s.borrow_mut() = slot;
         }
     }
@@ -843,7 +1138,7 @@ impl ModuleEngine {
         // W-4's wasm clippy lane would otherwise trip -D warnings on it).
         #[cfg(all(target_arch = "wasm32", feature = "wasm-emit"))]
         #[allow(clippy::needless_return)]
-        if c >= self.t2_threshold && self.wasm_untried(idx) {
+        if due(c, self.t2_threshold) && self.wasm_untried(idx) {
             if let Some(f) = self.func_ref(idx) {
                 let slot = self.compile_wasm(idx, f);
                 self.install_wasm(idx, slot);
@@ -864,7 +1159,7 @@ impl ModuleEngine {
         // `func_ref` returns `None` — collapsing would instead fall through to try the baseline branch in
         // that case, silently changing the "cranelift attempted this call ⇒ never also try baseline this
         // same call" priority the two branches are written to preserve.
-        if c >= self.t2_threshold && self.cranelift_ptr(idx).is_none() {
+        if due(c, self.t2_threshold) && self.cranelift_ptr(idx).is_none() {
             if let Some(f) = self.func_ref(idx) {
                 let code = otter_cranelift::compile_dispatch_fn(
                     &self.isa,
@@ -883,7 +1178,7 @@ impl ModuleEngine {
         // cranelift branch above, collapsing into a single `&&`-chained condition changes nothing: whether
         // `func_ref` succeeds or not, falling out of this `if` either way just ends the function.)
         #[cfg(all(target_arch = "x86_64", not(target_os = "none")))]
-        if c >= self.t1_threshold
+        if due(c, self.t1_threshold)
             && self.baseline_ptr(idx).is_none()
             && let Some(f) = self.func_ref(idx)
         {
@@ -906,10 +1201,22 @@ impl ModuleEngine {
     fn install_cranelift(&self, idx: usize, code: otter_cranelift::CompiledDispatchFn) {
         let base = self.base();
         if idx < base {
+            // H3: add-only tripwire — overwriting would drop the old `CompiledDispatchFn` (and its
+            // executable buffer) while in-flight frames may still be executing it (munmap-UAF).
+            // `maybe_tier_up` only compiles when the slot is `None`; this assert makes a future
+            // second caller fail loudly in debug instead of silently freeing live code.
+            debug_assert!(
+                self.cranelift[idx].borrow().is_none(),
+                "install_cranelift over an occupied slot (add-only violation — munmap-UAF)"
+            );
             *self.cranelift[idx].borrow_mut() = Some(code);
             return;
         }
         if let Some(slot) = self.pushed_cranelift.borrow().get(idx - base) {
+            debug_assert!(
+                slot.borrow().is_none(),
+                "install_cranelift over an occupied pushed slot (add-only violation — munmap-UAF)"
+            );
             *slot.borrow_mut() = Some(code);
         }
     }
@@ -919,10 +1226,19 @@ impl ModuleEngine {
     fn install_baseline(&self, idx: usize, code: otter_baseline::CompiledDispatchFn) {
         let base = self.base();
         if idx < base {
+            // H3: same add-only tripwire as `install_cranelift` (overwrite = ExecBuf munmap-UAF).
+            debug_assert!(
+                self.baseline[idx].borrow().is_none(),
+                "install_baseline over an occupied slot (add-only violation — munmap-UAF)"
+            );
             *self.baseline[idx].borrow_mut() = Some(code);
             return;
         }
         if let Some(slot) = self.pushed_baseline.borrow().get(idx - base) {
+            debug_assert!(
+                slot.borrow().is_none(),
+                "install_baseline over an occupied pushed slot (add-only violation — munmap-UAF)"
+            );
             *slot.borrow_mut() = Some(code);
         }
     }
@@ -1065,10 +1381,12 @@ impl ModuleEngine {
                 // The panic never reached module_dispatch/tail_signal's own catch_unwind (no compiled
                 // frame was on the stack when it happened) — contain it here instead, exactly as those two
                 // do, so this boundary gives the outermost call the SAME "never abort" guarantee nested
-                // calls already had.
-                self.trapped.set(true);
-                self.trapped_idx.set(Some(idx));
-                Err(Trap { idx })
+                // calls already had. `record_trap` preserves an earlier trap's idx/reason (H1a pin), so
+                // the returned Trap names whatever the poisoned engine actually records.
+                self.record_trap(idx, TrapReason::Panic);
+                Err(Trap {
+                    idx: self.trapped_idx.get().unwrap_or(idx),
+                })
             }
         }
     }
@@ -1109,21 +1427,37 @@ impl ModuleEngine {
     /// triggered by that function's shape — calling that SAME function again after `clear_trap` is expected
     /// to trap again, identically and reproducibly (this is a poison-flag reset, not a retry/backoff/
     /// blacklist mechanism; see [`Trap::idx`] for the diagnostic needed to build one at the embedder level).
+    /// **Exception (H1a): the two stack-GUARD traps** ([`TrapReason::StackBudget`]/
+    /// [`TrapReason::DepthLimit`]) are not deterministic-in-the-bytecode that way — they depend on limits
+    /// and live stack state, so raise the limit ([`Self::set_stack_budget`]/[`Self::set_depth_limit`]),
+    /// or retry with shallower input, `clear_trap`, and the SAME call can genuinely succeed (the O-10
+    /// recoverable-contract applies in full; a guard trap is NOT the wasm §2.4 discard-only class, which
+    /// remains wasm-trap-only — see [`Self::try_dispatch`]'s wasm paragraph).
     /// In particular, call counters are strictly add-only (`saturating_add`, never decremented by
     /// `clear_trap` or anything else — see [`Self::calls`]) and Cranelift (T2) tier-up unconditionally takes
     /// priority over baseline (T1) once a function's count crosses the T2 threshold (see the private
     /// `maybe_tier_up`) — so a function whose T2 compile panics deterministically will keep retrying ONLY
     /// the T2 compile on every subsequent call, forever; it never gets a chance to fall back to T1.
+    ///
+    /// H1a pin (i): `clear_trap` deliberately does NOT touch the guard bookkeeping (`depth`/
+    /// `stack_base`) — it may legitimately be called from the MIDDLE of a live call tree (the whole
+    /// point of recoverability), where the outer activations' depth must keep counting; the sole
+    /// decrement is [`FrameGuard`]'s RAII `Drop`. The guards therefore stay fully armed across a
+    /// `clear_trap`, at unchanged limits.
     pub fn clear_trap(&self) {
         self.trapped.set(false);
         self.trapped_idx.set(None);
+        self.trap_reason.set(TrapReason::Panic); // hygiene, like trapped_idx — the idle default
         self.tail_pending.set(false);
     }
 }
 
 /// Returned by [`ModuleEngine::try_dispatch`]/[`ModuleEngine::try_run`] when the engine is (or just became,
-/// during this very call) [`trapped`](ModuleEngine::trapped) — i.e. this is a caught FFI-boundary panic
-/// (malformed bytecode, or an internal bug in a compiled tier), NEVER a guest-level value. An out-of-range
+/// during this very call) [`trapped`](ModuleEngine::trapped) — i.e. a caught FFI-boundary panic
+/// (malformed bytecode, or an internal bug in a compiled tier) or, since H1a, a stack-guard limit
+/// ([`ModuleEngine::trap_reason`] distinguishes: [`TrapReason::StackBudget`]/[`TrapReason::DepthLimit`]
+/// are recorded with NO panic at all — flag + `fill`, and are recoverable by raising the limit +
+/// [`ModuleEngine::clear_trap`], per the O-10 contract). NEVER a guest-level value. An out-of-range
 /// callee index is NOT a trap (it is an existing, defined fallback that returns [`Module::fill`] as an
 /// ordinary `Ok` value) — see [`ModuleEngine::try_dispatch`]'s doc for the full trap-vs-value contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1138,6 +1472,11 @@ pub struct Trap {
     /// nothing records its idx before the panic reaches `try_dispatch`'s own outer boundary; in that case
     /// `idx` is the OUTERMOST index (the one originally passed to `try_dispatch`/`try_run`), not the actual
     /// fault site. Either way this is a diagnostic hint (the nearest available site), not a full backtrace.
+    ///
+    /// H1a: for a stack-GUARD trap (no panic involved — [`TrapReason::DepthLimit`]/
+    /// [`TrapReason::StackBudget`]), `idx` is instead the callee index of the `enter_frame` that would
+    /// have exceeded the limit — for a runaway recursion, usually the recursing function itself. The
+    /// panic-boundary hint semantics above apply only to the [`TrapReason::Panic`] reason.
     pub idx: usize,
 }
 
@@ -1181,8 +1520,7 @@ extern "C" fn module_dispatch(eng: *const ModuleEngine, idx: i64, args: *const V
         match catch_unwind(AssertUnwindSafe(|| engine.dispatch(idx, args))) {
             Ok(v) => v,
             Err(_) => {
-                engine.trapped.set(true);
-                engine.trapped_idx.set(Some(idx));
+                engine.record_trap(idx, TrapReason::Panic);
                 engine.module.fill
             }
         }
@@ -1232,8 +1570,7 @@ extern "C" fn module_dispatch(eng: *const ModuleEngine, idx: i64, args: *const V
             Ok(v) => v,
             Err(_) => {
                 // Err ⇒ poison (§13-1), exactly as the native path and `tail_signal` do.
-                engine.trapped.set(true);
-                engine.trapped_idx.set(Some(idx));
+                engine.record_trap(idx, TrapReason::Panic);
                 engine.module.fill
             }
         }
@@ -1303,10 +1640,9 @@ extern "C" fn tail_signal(eng: *const ModuleEngine, callee: i64, args: *const Va
         // trampoline's post-call `!tail_pending.get()` check sees `false` and returns this `fill` as a
         // plain value — poisoning still takes effect on the engine's NEXT dispatch (checked at the top of
         // the loop), exactly as an ordinary caught panic in `module_dispatch` already behaves.
-        engine.trapped.set(true);
         // Same full-width conversion for the diagnostic hint (A-C1) — `Trap::idx` must name the
         // same index the range check would have seen, not a width-dependent truncation of it.
-        engine.trapped_idx.set(Some(otter::interp::callee_index(callee)));
+        engine.record_trap(otter::interp::callee_index(callee), TrapReason::Panic);
     }
     engine.module.fill // discarded by the caller; only `tail_pending` discriminates tail-vs-value
 }
@@ -1687,7 +2023,7 @@ mod tests {
         // independently callable and correct.
         let isa = call_isa();
         let module = sq_module(); // base = 1
-        let eng = ModuleEngine::new(isa, module, 10_000_000, 10_000_000); // stay interpreted; not the point here
+        let eng = ModuleEngine::interpreter_only(isa, module); // T0-pinned (H5); tiering is not the point here
         let mut idxs = Vec::new();
         for k in 1..=4i64 {
             let def = FuncDef {
@@ -1803,7 +2139,7 @@ mod tests {
         // `Box` indirection it must complete with the correct result.
         let isa = call_isa();
         let module = sq_module(); // funcs = [sq]; base = 1
-        let eng = ModuleEngine::new(isa.clone(), module.clone(), 10_000_000, 10_000_000); // stay interpreted
+        let eng = ModuleEngine::interpreter_only(isa.clone(), module.clone()); // T0-pinned (H5)
         let a_def = FuncDef {
             nparams: 1,
             consts: vec![],
@@ -2739,6 +3075,82 @@ mod tests {
             assert!(!eng.trapped(), "fill fallback is a defined value, never a trap");
             assert_eq!(eng.tier_of(0), tier, "Call caller ran at the intended tier");
             assert_eq!(eng.tier_of(1), tier, "TailCall caller ran at the intended tier");
+        }
+    }
+
+    // ===================================================================================================
+    // H5 — the NEVER threshold sentinel as a SUPPORTED T0/T1/T2-shaping contract. One pin test per row
+    // of `ModuleEngine::new`'s mode table (the mutation target for each: someone "simplifying" `due`
+    // back to a bare `c >= threshold`, which makes a saturating counter eventually meet u32::MAX).
+    // ===================================================================================================
+
+    #[test]
+    fn interpreter_only_never_promotes_and_stays_correct() {
+        // Mode row 1: t1 == t2 == NEVER (via the named constructor). Many calls, zero promotion.
+        let isa = call_isa();
+        let module = sq_module();
+        let eng = ModuleEngine::interpreter_only(isa, module);
+        for _ in 0..50 {
+            assert_eq!(eng.run(&[5]), 25);
+            assert_eq!(
+                eng.tier_of(0),
+                "interpreter",
+                "NEVER/NEVER must be T0-pinned at every call count"
+            );
+        }
+        assert!(!eng.trapped());
+    }
+
+    #[test]
+    fn t2_never_caps_at_baseline_and_never_reaches_cranelift() {
+        // Mode row 2: real t1, t2 == NEVER — a T1 cap. The function must promote to baseline and then
+        // STAY there ("baseline" stable, never "cranelift"), however many further calls arrive.
+        let isa = call_isa();
+        let module = sq_module();
+        let eng = ModuleEngine::new(isa, module, 2, NEVER);
+        for k in 0..50 {
+            assert_eq!(eng.run(&[6]), 36);
+            let tier = eng.tier_of(0);
+            assert_ne!(
+                tier, "cranelift",
+                "t2 == NEVER must never promote to T2 (call {k})"
+            );
+            if k >= 2 {
+                assert_eq!(tier, "baseline", "t1 = 2 must still promote to T1 (call {k})");
+            }
+        }
+        #[cfg(all(not(target_family = "wasm"), not(target_os = "none")))]
+        assert!(
+            eng.cranelift_ptr(0).is_none(),
+            "no T2 code may ever be installed under t2 == NEVER"
+        );
+    }
+
+    #[test]
+    fn t1_never_goes_straight_to_cranelift_with_baseline_forever_none() {
+        // Mode row 3 (the assert-relaxation case, t1 > t2 numerically): t1 == NEVER, t2 real — T2
+        // direct. interpreter → cranelift with NO baseline stopover, and `baseline_ptr` permanently
+        // None (no T1 RX page is ever emitted — the B2 attack-surface-reduction property).
+        let isa = call_isa();
+        let module = sq_module();
+        let eng = ModuleEngine::new(isa, module, NEVER, 3);
+        for k in 0..20 {
+            assert_eq!(eng.run(&[7]), 49);
+            let tier = eng.tier_of(0);
+            assert_ne!(
+                tier, "baseline",
+                "t1 == NEVER must never produce a T1 tier (call {k})"
+            );
+            if k < 2 {
+                assert_eq!(tier, "interpreter", "below t2 the function stays T0 (call {k})");
+            } else {
+                assert_eq!(tier, "cranelift", "t2 = 3 promotes straight to T2 (call {k})");
+            }
+            #[cfg(all(target_arch = "x86_64", not(target_os = "none")))]
+            assert!(
+                eng.baseline_ptr(0).is_none(),
+                "baseline slot must stay permanently None under t1 == NEVER (call {k})"
+            );
         }
     }
 }

@@ -294,9 +294,39 @@ verify-before-implement 절차(산물 바이트 변경이므로 차등 게이트
 | 중 | C2 | 참조 호스트 README + 릴리즈 노트 템플릿에 '시간-드러내는 표면' 표준 목록표 추가(p1 full-surface 배선이라는 사실 자체를 표면 선언으로 기재) |
 | 중 | C2 | 클럭-프리 배선 레시피 제공 검토: p1::add_to_linker_sync 전체 배선 대신 시간-표면(clocks/poll/filestat)을 뺀 부분 배선 예시(또는 호스트 플래그)를 문서/데모로 제공 |
 
+## 2차 평가: v1.0.0-testing.2 (2026-11-01)
+
+**판정**: 통과(PASS) — exposed-open 클래스 없음. 1차 평가의 반복 의무(per_release_duty)를 `testing.1`(631801a) → 본 컷 변경분(H-패키지 a8bb6f0 + 의존성 보안 갱신 + 툴체인 상향)에 대해 수행했다. 이번 컷의 핵심은 **호스트 트레인이 보안 권고 다수에 노출된 상태(wasmtime/wasmtime-wasi 48.0.1)를 50.0.1로 해소**한 것이다.
+
+### 근거 (모두 본 세션 실측)
+
+- **업스트림 권고 점검 (의무 (d1)(ii) / (d2)(i) / (a)(ii) / (b)(iii))**: 전 락파일(루트 + hosts/* + demos/*, registry 패키지 241개)을 OSV(crates.io)로 일괄 조회 → 5개 패키지에 권고 존재: `wasmtime 48.0.1`(23건: GHSA-9pvw-hwfg-92h5, GHSA-mghf-wjfp-p5xm[CRITICAL, aarch64 br_table], RUSTSEC-2026-0315/0316/0325/0326/0327/0353~0359/0361~0364/0378/0379/0422~0424), `wasmtime-wasi 48.0.1`(7건: RUSTSEC-2026-0314/0321~0324/0352/0420), `wasmtime 45.0.3`(10건, 루트 dev-dep 오라클), `tokio 1.53.1`(RUSTSEC-2026-0386), `memmap2 0.2.3`(RUSTSEC-2026-0186). 전 wasmtime/wasmtime-wasi 항목의 patched 버전 ≤ 50.0.1(가장 높은 것: 0420~0424의 48.0.8/49.0.5/50.0.1) → **호스트 2종 + 루트 오라클을 50.0.1로 상향**(소스 변경 0). tokio는 1.54.1로 상향. 갱신 후 재조회: **209개 패키지 중 권고 1건**(memmap2 0.2.3, 아래).
+- **잔여: `memmap2 0.2.3` (RUSTSEC-2026-0186, 경유: cranelift-jit 0.132.3 → otter-cranelift)**: 영향 함수는 `advise_range`/`unchecked_advise_range`/`flush_range`/`flush_async_range`로 한정. cranelift-jit-0.132.3 소스(`memory/system.rs`)와 otter 전 소스를 grep → **해당 함수 호출 0건**(도달 불가). 해소하려면 cranelift 0.132 → 0.136+ 상향(memmap2 ^0.9.11 요구) = T2 JIT 의존 범프로 별도 트랙(아래 후속).
+- **Cranelift aarch64 `br_table`(CVE-2026-115893)**: otter T2가 쓰는 cranelift-codegen 0.132.3 계열도 이론상 영향권(aarch64 한정, >~256k 타깃 br_table). otter-cranelift는 br_table/jump-table을 **방출하지 않음**(grep 0건)이고 T2 실행 아키텍처는 x86-64뿐 → 현 구성 not-exposed. Twasm/A-모드가 방출하는 wasm `br_table`은 호스트 wasmtime이 컴파일하며 50.0.1은 수정판. **aarch64 T2 승격(Tier-1 로드맵) 시 본 항목 재심 의무.**
+- **스윕 (의무 (a)(i), (c)(i), (f)-B1~B5)**: 631801a..a8bb6f0 변경분(crates/ 12파일 + tests)을 스윕 — 신규 시계 API 0, `unsafe impl Send|Sync` 0, `catch_unwind` 0, mmap/mprotect/호스트 fn 등록/WASI 링커 변경 0, `hosts/` 소스 변경 0. 스레드 스폰 1건은 **테스트 전용**(`tests/h1a_stack_guard.rs:223`, 스택 한도 검증용). 방출 바이트: 새 `0xFF` 오퍼랜드는 `dec ecx`(FF C9, 간접 jmp/call 아님)와 disp32 데이터뿐 → 간접 전이는 기존 `call rax` 2곳 + cranelift `call_indirect`만 유지(B4 불변).
+- **H-패키지 효과**: B1(CFI) — T1 `endbr64` 선방출 채택(`endbr64_at_head_of_every_emitted_function` 단정), T2는 여전히 랜딩패드 없음(IBT 강제 + T2 조합은 t2=NEVER 우회); B3 — `install_*` add-only `debug_assert` 신설; (b) 스택 오버플로(방출 프레임 프로브 부재) — T1 sub-후-터치 + T2 inline probestack + 스택 이중 가드(1 MiB 예산 + 깊이 4096)로 fail-stop/회복가능 Trap화.
+- **게이트 실행 (Rust 1.99.1, wasmtime 50.0.1, `--locked`)**: `just ci`(fmt + clippy -D + 워크스페이스 테스트 + no_std) · `wasm-e2e` · `wasm-aot-link-e2e` · `wasm-aot-component` · `wasm-aot-e2e` · `wasm64-smoke` · `wasm-e2e-atomics`(d1 의무 (iv)) · `wasm-e2e-p3`(d2 의무 (ii): `HOST-P3-STORE-SYNC-OK` 래치 프로브 + `NEGPROBE-P3-UNWIRED-OK`) **전부 EXIT=0**. 툴체인 1.99 clippy 신규 린트(`chunks_exact_to_as_chunks`) 2건은 테스트 코드 수정(동일 의미)으로 해소.
+- **(d2) p3 핀 이동**: `=48.0.1` 락 핀 → **50.0.1 락 핀**(p3 표면은 여전히 semver-면제·보안패치 비보장 자기선언). S2 경계 실측(E5 래치 프로브)은 50.0.1에서 재실행되어 녹색. p3-bridge는 기본 OFF feature 격리 유지.
+- **(c)(ii) 시간-드러내는 표면 목록 (변동 없음)**: 참조 호스트 = WASI p1 전체 표면 동기 배선(`clock_time_get`, `poll_oneoff` 타임아웃, fd/path_filestat 타임스탬프) + p3-bridge 빌드에서 `wasi:clocks/monotonic-clock@0.3.0`. 호스트 소스 변경 없음.
+
+### 정직한 미수행/한계
+
+- (d1)(d2)의 "GitHub 이슈 트래커 직접 점검"은 **수행하지 않았다** — 본 평가는 보안 권고 DB(RustSec/GHSA via OSV)와 crates.io 메타데이터 기준이다. tier-2(threads)·p3의 CVE 미발급 이슈는 이 경로로 보이지 않으므로 다음 릴리즈 전 수동 점검 의무로 이월.
+- aarch64 실기 게이트는 없음(x86-64에서만 실행·검증).
+- 위 OSV 조회는 조회 시점(2026-11-01) 스냅샷이다.
+
+### 후속(다음 컷 이전 권장)
+
+| 우선 | 항목 |
+|---|---|
+| 중 | cranelift 0.132 → 0.136+ 상향(memmap2 0.2.3 제거, br_table 수정 포함) — T2 JIT 의존 범프이므로 3-티어 차등 게이트 전체 재실행 필요 |
+| 중 | 매 컷 전 OSV 락 스윕을 just 레시피로 기계화(이번에는 수동 스크립트) |
+| 하 | (d1)(d2) GitHub 이슈 트래커 수동 점검 |
+
 ## 평가 이력
 
 | 릴리즈 | 일자 | 판정 | 비고 |
 |---|---|---|---|
 | v1.0.0-testing.1 | 2026-09-04 | 조건부 통과(조건 2건 처분 완료) | 1차 평가(게이트 발효 릴리즈) |
 | v1.0.0-testing.1 (확장 부기) | 2026-09-04 | 통과 — exposed-open 없음 | 오너 목록 14클래스 편입 평가 |
+| v1.0.0-testing.2 | 2026-11-01 | 통과 — exposed-open 없음 | 2차 평가: H-패키지 + 호스트 트레인 wasmtime 48.0.1→50.0.1 보안 갱신 + 툴체인 1.99.1 |

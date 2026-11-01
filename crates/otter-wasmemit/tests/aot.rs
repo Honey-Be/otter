@@ -2881,8 +2881,11 @@ fn jw_read_args(caller: &mut Caller<'_, JitSt>, ptr: i32, argc: i64) -> Vec<Valu
     let mut buf = vec![0u8; argc as usize * 8];
     mem.read(&mut *caller, ptr as u32 as usize, &mut buf)
         .expect("args live in the mock memory");
-    buf.chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().expect("chunks_exact(8)")))
+    // `buf.len()` is `argc * 8`, so the (discarded) remainder is empty.
+    buf.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect()
 }
 

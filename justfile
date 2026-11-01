@@ -191,7 +191,7 @@ wasm-e2e toolchain=wasm-nightly: (wasm-toolchain toolchain)
     echo "✓ wasm-e2e ({{toolchain}}): §8(c) acceptance 1-7 + §8(b) cross-tier all green"
 
 # O-14 A-5 gate (design otter-o14-aot-core-design.md §8.2/§9 A-5): the AOT-artifact E2E on the
-# HOST-train shape — hosts/otter-aot-e2e (workspace-excluded, wasmtime 48, reference-host features
+# HOST-train shape — hosts/otter-aot-e2e (workspace-excluded, wasmtime 50, reference-host features
 # + Config verbatim; README.md there has the placement rationale). STABLE-only: the artifact is
 # generated at run time by compile_module (single-lowering-source rule — no pre-emitted bytes to
 # drift), so no nightly/`wasm-toolchain` prerequisite. Phases/markers: entry (argc=0 v1 contract,
@@ -208,7 +208,7 @@ wasm-e2e toolchain=wasm-nightly: (wasm-toolchain toolchain)
 # wasm_memory64(false) rejection (Err-assert, A32 still accepted) / the MF-1 table64 vector
 # (go()→7). `cargo test` runs the reference_config no-drift pin (the tech-S1 single-builder
 # discipline made machine-checked).
-# O-14 A-5 + O-19 C3 gate: AOT artifact E2E (A32 phases + A64 lane) on the wasmtime-48 host shape
+# O-14 A-5 + O-19 C3 gate: AOT artifact E2E (A32 phases + A64 lane) on the wasmtime-50 host shape
 wasm-aot-e2e:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -353,7 +353,7 @@ wasm-aot-tools:
 
 # ──────────────── O-16c′ L-2: b′ productization — hosts/otter-helpers-wasm build + gates ────────────────
 # The design §4.2 recipe verbatim, both profiles (non-shared / +atomics), STABLE via plain
-# `cargo` (rust-toolchain.toml governs — panel T-S2: no `cargo +1.96.0` second pin authority):
+# `cargo` (rust-toolchain.toml governs — panel T-S2: no `cargo +1.99.1` second pin authority):
 #   cargo build --locked --release --target wasm32-wasip1
 #   otter-aot-link lib-manifest --extract <unstripped>       # sidecar stage ① (§2-2): PRE-strip
 #   wasm-tools strip                                         # pinned, non-PATH (§3.2)

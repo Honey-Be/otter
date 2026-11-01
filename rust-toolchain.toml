@@ -1,6 +1,6 @@
-# Pinned per decision: stable >= 1.96 + 2024 edition (memory: runtime-rust-toolchain-config).
+# Pinned per decision: stable >= 1.99 + 2024 edition (memory: runtime-rust-toolchain-config).
 [toolchain]
-channel = "1.96.0"
+channel = "1.99.1"
 components = ["rustfmt", "clippy", "rust-src"]
 # wasm targets (runtime ABI; wasip1 is the O-13 v1 deployment target — design §5.5, pinned here
 # since W-3 so the wasm-emit cross-check doesn't depend on an ad-hoc `rustup target add`) + a

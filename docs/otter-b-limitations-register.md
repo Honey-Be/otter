@@ -136,7 +136,7 @@
 
 ## A-모드 (AOT/컴포넌트) — B11~B17
 
-### B11. p3 충족은 아키텍처-수준(실행 표면 = 2패키지 동기 함수 2개) — sync-WIT 한정, =48.0.1 핀 결박(semver-면제 표면)
+### B11. p3 충족은 아키텍처-수준(실행 표면 = 2패키지 동기 함수 2개) — sync-WIT 한정, =50.0.1 핀 결박(semver-면제 표면; testing.2에서 48.0.1→50.0.1 이동)
 
 - **심각도(testing 실사용)**: 중 (medium)
 - **영향 대상**: J-모드 참조 호스트를 p3-bridge feature로 빌드해 WASIp3 서비스를 게스트에 공급하려는 임베더; 스트림 I/O·비동기 sockets·wait-* 등 async-WIT 기능이 필요한 임베더; p3-bridge 포함 호스트를 장기 배포·wasmtime 범프하려는 운영자.
@@ -144,9 +144,9 @@
   - async-WIT p3 임포트(wait-for류·스트림 I/O)를 배선 시도 → 동기 인스턴스화 거부 + 실패 시도 자체가 Store를 래치(latch-then-validate, o16f §1-S2-E5 실측) → 이후 모든 동기 진입점이 validate_sync_call로 거부 → otter_jit.compile 전건 -2 → 침묵 전면 T0 강등(o16f §4). 크래시 없이 성능만 조용히 붕괴하는 fail-open 클래스.
   - async 인스턴스화 후 동기-lift에서 블로킹하는 표면 호출 → "cannot block a synchronous task" trap으로 게스트 실행 중단(E5 실측).
   - "p3 충족"을 폭(breadth)-수준으로 오독: 실측 실행 표면은 wasi:clocks/monotonic-clock@0.3.0 + wasi:random/random@0.3.0의 동기 함수 2개뿐(o16f §8). cli/filesystem-types/sockets-types 등 화이트리스트-적격 동기 표면도 미실행이라 배선 시 미검증 경로를 밟는다 [추정].
-  - wasmtime-wasi를 48.0.1 밖으로 범프 → p3 호스트 표면은 semver-면제 자기선언("not compliant with semver… Bug and security fixes limited to wasip3 will not be given patch releases", p3/mod.rs 축자) — API 파손·거동 변화가 예고 없이 발생 가능하고, 배포 호스트가 보안패치-비보장 실험 표면을 나른다(o16f §6).
+  - wasmtime-wasi를 락 핀(현 50.0.1; testing.1은 48.0.1) 밖으로 범프 → p3 호스트 표면은 semver-면제 자기선언("not compliant with semver… Bug and security fixes limited to wasip3 will not be given patch releases", p3/mod.rs 축자) — API 파손·거동 변화가 예고 없이 발생 가능하고, 배포 호스트가 보안패치-비보장 실험 표면을 나른다(o16f §6).
 - **조기 탐지 신호**: HOST-P3-STORE-SYNC-OK 래치 프로브 적색(매 실행 기계-고정); 티어업 계수 0 + 전 compile 반환 -2(전면 T0 강등 징후); "cannot block a synchronous task" trap; NEGPROBE-P3-UNWIRED-OK·just wasm-e2e-p3 게이트 적색; 범프 후 p3 모듈 컴파일/링크 에러.
-- **완화/우회**: 브리지 표면을 §3-2 동기-WIT 화이트리스트 안으로 엄수(MUST); async-향 요소(async 호스트 함수 실링크·async limiter/call-hook/fuel-yield)를 게스트 Store에 절대 반입 금지; =48.0.1 락 핀 유지; p3 불요 배포는 스톡 빌드 사용(feature 격리 실측 — 표면 미컴파일); 매 testing/stable 릴리즈에서 업스트림 이슈 점검(§6 릴리즈 게이트); 자체 호스트 제작 시 래치 프로브를 이식.
+- **완화/우회**: 브리지 표면을 §3-2 동기-WIT 화이트리스트 안으로 엄수(MUST); async-향 요소(async 호스트 함수 실링크·async limiter/call-hook/fuel-yield)를 게스트 Store에 절대 반입 금지; =50.0.1 락 핀 유지; p3 불요 배포는 스톡 빌드 사용(feature 격리 실측 — 표면 미컴파일); 매 testing/stable 릴리즈에서 업스트림 이슈 점검(§6 릴리즈 게이트); 자체 호스트 제작 시 래치 프로브를 이식.
 - **재평가 트리거**: async-WIT 수요 발생(E4 전면 async 재배선 이행 — 선행 게이트 2건: Instance::new_async 규범화 + tokio 도입 영향 평가, o16f §5); wasmtime-wasi 핀 범프(S2 경계 실측 E5 재실행 의무); wasip3 rustup 프리빌트 std 출현(S1 재평가); 업스트림 p3 표면의 semver 준수 전환.
 
 ### B12. 역방향 프록시(컴포넌트→코어)는 미실측 — [추론]만 존재

@@ -337,14 +337,14 @@ dependencies = [
 
 [[package]]
 name = "otter"
-version = "1.0.0-testing.1"
+version = "1.0.0-testing.2"
 dependencies = [
  "half",
 ]
 
 [[package]]
 name = "otter-baseline"
-version = "1.0.0-testing.1"
+version = "1.0.0-testing.2"
 dependencies = [
  "libc",
  "otter",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "otter-cranelift"
-version = "1.0.0-testing.1"
+version = "1.0.0-testing.2"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "otter-engine"
-version = "1.0.0-testing.1"
+version = "1.0.0-testing.2"
 dependencies = [
  "otter",
  "otter-baseline",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "otter-wasmemit"
-version = "1.0.0-testing.1"
+version = "1.0.0-testing.2"
 dependencies = [
  "otter",
  "wasm-encoder",

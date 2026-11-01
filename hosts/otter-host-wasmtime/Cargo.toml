@@ -1,5 +1,5 @@
 # otter-host-wasmtime — O-13 §5.5 reference host shim (design doc
-# .claude-research-library/otter-o13-wasm-emit-design.md §5): a native wasmtime-48 embedding that
+# .claude-research-library/otter-o13-wasm-emit-design.md §5): a native wasmtime-50 embedding that
 # runs an otter wasm32-wasip1 guest with real WASI preview1 wiring plus the `otter_jit.compile`
 # dynamic-compilation contract (§5.1/§5.3). This is the W-5 PRODUCT-quality successor to the W-0
 # spike host (spikes/o13-w0-jit-contract/host — kept verbatim as the committed measurement);
@@ -9,7 +9,7 @@
 name = "otter-host-wasmtime"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.99"
 license = "BSD-2-Clause-Patent"
 authors = ["newsniper-org"]
 publish = false
@@ -17,7 +17,7 @@ publish = false
 # Workspace-EXCLUDED like demos/otter-wasm-demo (same rationale, §9): this crate is a native-only
 # executable with a heavy dependency tree (wasmtime + wasmtime-wasi) that must not ride into
 # `cargo build/test --workspace`; the empty [workspace] table stops cargo's upward discovery.
-# It builds on the repo's pinned stable (1.96.0) — no nightly anywhere on the host side.
+# It builds on the repo's pinned stable (1.99.1) — no nightly anywhere on the host side.
 [workspace]
 
 [dependencies]
@@ -39,7 +39,7 @@ publish = false
 # only; this shim never turns on Config::async_support and uses exclusively synchronous calls
 # (W-0 disposition A#4 — see src/main.rs). `component-model-async` is NOT in this build graph
 # (that would take wasmtime-wasi's opt-in `p3` feature — escalation research §1.6-1).
-wasmtime = { version = "48", default-features = false, features = [
+wasmtime = { version = "50", default-features = false, features = [
     "runtime",
     "cranelift",
     "gc",
@@ -57,7 +57,7 @@ wasmtime = { version = "48", default-features = false, features = [
 ] }
 # Real WASI preview1 wiring (design §5.5 W-5 확정): p1::add_to_linker_sync + WasiCtxBuilder.
 # Lockstep-pinned to the same family as wasmtime (the two crates version in lockstep upstream).
-wasmtime-wasi = { version = "48", default-features = false, features = ["p1"] }
+wasmtime-wasi = { version = "50", default-features = false, features = ["p1"] }
 
 [features]
 # O-16f p3-bridge (design note .claude-research-library/otter-o16f-p3-bridge.md; mode doc §1.1
@@ -82,7 +82,7 @@ wasmtime-wasi = { version = "48", default-features = false, features = ["p1"] }
 # RELEASE-GATE NOTE (owner §6-4 spike-gate acceptance): the p3 module's semver exemption and
 # "bug and security fixes limited to wasip3 will not be given patch releases" self-declaration
 # mean this surface must be on the release security-gate review list for as long as the feature
-# exists (recorded in the design note §6; the =48.0.1 lockfile pin + --locked builds bound the
+# exists (recorded in the design note §6; the =50.0.1 lockfile pin + --locked builds bound the
 # exposure to deliberate pin bumps).
 p3-bridge = ["wasmtime/component-model", "wasmtime/wat", "wasmtime-wasi/p3"]
 

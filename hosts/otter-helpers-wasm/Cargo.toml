@@ -6,7 +6,7 @@
 # memory ownership — the whole of the gate-profile M2a engine library (SPK B1).
 #
 # Built by `just wasm-bprime` on the REPO-PINNED STABLE via plain `cargo` (rust-toolchain.toml
-# governs — design §4.2 panel T-S2: an explicit `cargo +1.96.0` would create a second pin
+# governs — design §4.2 panel T-S2: an explicit `cargo +1.99.1` would create a second pin
 # authority, rejected). Target wasm32-wasip1 (pinned in rust-toolchain.toml since W-3).
 #
 # PLACEMENT DECISION (design §4.1, recorded verbatim per the A-5/L-1a precedent): hosts/ is a
@@ -22,7 +22,7 @@
 name = "otter-helpers-wasm"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.99"
 license = "BSD-2-Clause-Patent"
 authors = ["newsniper-org"]
 publish = false

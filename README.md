@@ -21,7 +21,7 @@ are fine and expected; semantic gaps are release-blocking by policy).
 - `crates/` — the five workspace members above. Core crates are `#![no_std]` + `forbid(unsafe_code)`
   (unsafe is concentrated in the engine's FFI seams, documented per-site).
 - `hosts/` — workspace-EXCLUDED tooling (own lockfiles, heavy deps): `otter-host-wasmtime` (the
-  `otter_jit` contract reference host, wasmtime 48), `otter-aot-link` (rename/inject-marker/check/
+  `otter_jit` contract reference host, wasmtime 50), `otter-aot-link` (rename/inject-marker/check/
   shrink/manifest link tool), `otter-aot-e2e` (deployment-shape E2E + differentials),
   `otter-helpers-wasm` (the b′ engine library, stable+abort), `otter-glue-js` (browser glue).
 - `demos/otter-wasm-demo` — the in-guest acceptance suite (§8(c)).
@@ -32,7 +32,7 @@ are fine and expected; semantic gaps are release-blocking by policy).
 
 ## Building / gates
 
-Stable pin `rust-toolchain.toml` (1.96). `just ci` = fmt + clippy(-D) + workspace tests +
+Stable pin `rust-toolchain.toml` (1.99). `just ci` = fmt + clippy(-D) + workspace tests +
 no_std check. The wasm lanes (`just wasm-e2e`, `wasm-e2e-atomics`, `wasm-e2e-p3`, `wasm-aot-e2e`,
 `wasm-aot-link-e2e`, `wasm-aot-component`, `wasm64-smoke`) need the pinned nightly for guest builds
 (`just wasm-toolchain`) and the SHA-pinned external tools (`just wasm-aot-tools`); J-mode guest
@@ -41,8 +41,8 @@ builds are the only nightly consumers — A-mode artifacts are stable-toolchain 
 ## Release channels & versioning
 
 - **`main` = unstable** — development trunk.
-- **`testing`** — pre-stable channel; current cut **`v1.0.0-testing.1`** (owner-approved
-  2026-09-04). The `-testing.N` pre-release identifier is the channel marker.
+- **`testing`** — pre-stable channel; current cut **`v1.0.0-testing.2`** (first cut `v1.0.0-testing.1`,
+  owner-approved 2026-09-04). The `-testing.N` pre-release identifier is the channel marker.
 - **stable** — a future tag dropping the pre-release suffix, gated by the release checklist
   (`RELEASE-GATE.md`) and the tracked-limitations register (`docs/`).
 - Major-bump rule (owner, 2026-09-04): completing/deciding ALL items in the v2 register

@@ -23,13 +23,13 @@
 name = "otter-aot-e2e"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.99"
 license = "BSD-2-Clause-Patent"
 authors = ["newsniper-org"]
 publish = false
 
 # Workspace-EXCLUDED like hosts/otter-host-wasmtime and demos/otter-wasm-demo (same rationale):
-# the wasmtime-48 tree must not ride into `cargo build/test --workspace` (the workspace harness is
+# the wasmtime-50 tree must not ride into `cargo build/test --workspace` (the workspace harness is
 # pinned to family 45 via cranelift-0.132 lockstep — design §5.5; the two trains diverge by
 # design), and the empty [workspace] table stops cargo's upward discovery. Builds on the repo's
 # pinned stable (rust-toolchain.toml) — no nightly anywhere here: the artifact is generated at run
@@ -57,7 +57,7 @@ otter-aot-link = { path = "../otter-aot-link" }
 # AOT48-E2E-7 component differential incl. the §2-4-3 host-lift wiring. Same feature set the
 # b″ spike's aotgen host used (SPK tool-version row); growth stays in THIS crate's lockfile
 # (§8-8 host-train lockfile hygiene — the reference host is untouched).
-wasmtime = { version = "48", default-features = false, features = [
+wasmtime = { version = "50", default-features = false, features = [
     "runtime",
     "cranelift",
     "gc",

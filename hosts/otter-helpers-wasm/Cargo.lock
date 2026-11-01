@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "otter"
-version = "1.0.0-testing.1"
+version = "1.0.0-testing.2"
 dependencies = [
  "half",
 ]

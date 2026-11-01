@@ -23,7 +23,7 @@
 | C-6 | wasmer/Endive CM 성숙 | wasmer 릴리즈 | 제2 호스트 후보 재평가 | watching |
 | C-7 | b′ +atomics stable 경고→에러 전환 | rustc 릴리즈 노트 | b′ 빌드 파이프라인 대응(§ L-2 정본) | watching |
 | C-8 | wasip3 rustup 프리빌트 std 출현 | rust-lang 릴리즈 | wasip3 직접 게스트 빌드 재시도(현 3중 링크 벽) | watching |
-| C-9 | wasmtime-wasi p3 안정화/semver 편입 | wasmtime 릴리즈 노트 | =48.0.1 핀 결박 해제 + p3 표면 재평가 | watching |
+| C-9 | wasmtime-wasi p3 안정화/semver 편입 | wasmtime 릴리즈 노트 | =50.0.1 핀 결박 해제 + p3 표면 재평가 | watching |
 | C-10 | wasm64×WASI 외부 차단 | wasi-libc PR#444 | wasm64 게스트 std 경로 개통 검토 | watching |
 | C-11 | wasm64×컴포넌트 외부 차단 | component-model#22 | A64 산물 컴포넌트화 개통 검토 | watching |
 | C-12 | 스레드 간 공유 funcref 테이블 | shared-everything-threads Phase 1 | L2 멀티스레드 엔진 선결 해소(D3 연동) | watching |

@@ -28,11 +28,13 @@ wasm-encoder = { version = "0.258", default-features = false }
 wasmparser = { version = "0.258", default-features = false }
 
 [dev-dependencies]
-# §8(a) native differential harness. Family 45 is LOCKED (Cargo.lock already carries
-# wasmtime-internal-core 45 as a transitive dep of cranelift-codegen 0.132 — design §5.5): bump in
-# lockstep with cranelift only. Minimal features: the W-1a harness needs compile+run only — NO
+# §8(a) native differential harness (dev-only oracle). Family 50 since testing.2 (security refresh:
+# the 45 family is out of patch support and carried open RUSTSEC advisories). Family 45 was
+# previously "locked" to cranelift-codegen 0.132's transitive wasmtime-internal-core 45 (design
+# §5.5); the two now coexist in the lock (wasmtime's own cranelift 0.137 vs otter-cranelift's
+# 0.132 pin) — the harness only executes emitted wasm, it shares no types with otter-cranelift. Minimal features: the W-1a harness needs compile+run only — NO
 # exception handling (design §5.5: "§8(a) 하네스 자체는 EH 불요"), so no `gc`/`gc-drc`.
-wasmtime = { version = "45", default-features = false, features = [
+wasmtime = { version = "50", default-features = false, features = [
     "runtime",
     "cranelift",
     "std",

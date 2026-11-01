@@ -16,10 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # rust-toolchain.toml pins 1.96.0 + components + targets; the action honors it.
+      # rust-toolchain.toml pins 1.99.1 + components + targets; the action honors it.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           components: rustfmt, clippy
           targets: x86_64-unknown-none, wasm32-unknown-unknown, wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
@@ -100,7 +100,7 @@ jobs:
   #     re-review, never a red to silence.
   #   - THESE lanes are GATES: they assert that WITH the §7 configuration (pinned nightly +
   #     -Zbuild-std=std,panic_unwind + -Cpanic=unwind + exnref pin + --export-table/--growable-table,
-  #     wasmtime-48 host (O-16a) with wasm_exceptions(true) on gc+gc-drc features) in-wasm catch_unwind
+  #     wasmtime-50 host (O-16a) with wasm_exceptions(true) on gc+gc-drc features) in-wasm catch_unwind
   #     actually WORKS (W-0 M2 smoke — the O-12 fail-closed contract holding inside wasm), the
   #     wasm-emit cross-checks stay warning-free, and the workspace-excluded demo reaches FINAL LINK
   #     (engine + wasmemit + otter_jit import surface, deployment-representative profile — C#7/C#8).
@@ -110,11 +110,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Stable 1.96.0 (the rust-toolchain.toml pin) drives the wasmtime host build and the
+      # Stable 1.99.1 (the rust-toolchain.toml pin) drives the wasmtime host build and the
       # cross-check lane; wasm32-wasip1 has been in the toolchain file's target list since W-3.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           components: rustfmt, clippy
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
@@ -124,7 +124,7 @@ jobs:
           # Panel #3 C#1: the spike host (wasm-eh-smoke builds it) and the demo guest (wasm-demo-
           # build/wasm-e2e) are ALSO their own workspace-excluded workspaces — cache them too.
           # O-14 A-5: hosts/otter-aot-e2e is a fourth workspace-excluded workspace (wasm-aot-e2e
-          # step below). Cache impact (reviewed): one more cached wasmtime-48 native build tree,
+          # step below). Cache impact (reviewed): one more cached wasmtime-50 native build tree,
           # the same order as the reference host's row — it does NOT touch the demo's build-std
           # flavors or the workspace's wasmtime-45 harness cache (separate target dirs, separate
           # lockfiles), so no existing row is invalidated.
@@ -225,7 +225,7 @@ jobs:
       # and the unwired negative probe. LANE JUDGMENT (recorded):
       #   · BLOCKING here, despite wasmtime-wasi p3's "experimental, unstable and incomplete …
       #     not compliant with semver" self-declaration — because the exposure is bounded by the
-      #     host's own Cargo.lock (=48.0.1) + --locked builds: the unstable surface can only move
+      #     host's own Cargo.lock (=50.0.1) + --locked builds: the unstable surface can only move
       #     at a DELIBERATE pin bump, exactly like every other pinned dependency (§7.1-style
       #     discipline), so this step is deterministic, not drift-exposed. What the instability
       #     DOES cost is recorded where it belongs: the release security-gate list (p3 declares
@@ -242,7 +242,7 @@ jobs:
         run: just wasm-e2e-p3
 
       # O-14 A-5 (design §8.2/§9 A-5): the AOT-artifact E2E on the HOST-train shape —
-      # hosts/otter-aot-e2e (workspace-excluded, wasmtime 48, reference-host features + Config
+      # hosts/otter-aot-e2e (workspace-excluded, wasmtime 50, reference-host features + Config
       # verbatim). STABLE-only (the artifact is generated at run time by compile_module — no §7
       # nightly pipeline involved), so it lives in this lane for the host-train cache rows, not
       # for the nightly toolchain; it is deliberately NOT mirrored into the latest-nightly canary
@@ -290,7 +290,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.96.0"
+          toolchain: "1.99.1"
           components: rustfmt, clippy
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2

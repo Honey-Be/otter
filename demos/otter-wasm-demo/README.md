@@ -60,7 +60,7 @@ Flag inventory (all load-bearing, design §7 / §5.3):
 
 ## Why this crate is workspace-excluded
 
-The workspace pins stable 1.96.0 (`rust-toolchain.toml`) and must stay entirely
+The workspace pins stable 1.99.1 (`rust-toolchain.toml`) and must stay entirely
 stable-buildable; this crate's deliverable requires the nightly build-std pipeline above. As a
 workspace member it would either drag that requirement into `cargo build/test --workspace` or sit
 permanently broken. So it lives outside the root `members` list and carries an empty

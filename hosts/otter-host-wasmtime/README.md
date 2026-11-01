@@ -112,7 +112,7 @@ leftover `anyhow` line at the product level.
 ## Building / running the E2E
 
 ```sh
-cd hosts/otter-host-wasmtime && cargo build --locked --release   # repo-pinned stable 1.96.0
+cd hosts/otter-host-wasmtime && cargo build --locked --release   # repo-pinned stable 1.99.1
 just wasm-e2e                                                    # repo root: full §8(c) run
 ```
 
